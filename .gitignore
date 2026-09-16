@@ -1,0 +1,12 @@
+/data/
+/secrets/
+/.omc/
+/.omx/
+/.omo/
+/.worktrees/
+/.cache/
+/.env
+compose.secrets
+*.db
+*.db-shm
+*.db-wal
