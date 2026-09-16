@@ -203,3 +203,20 @@ func TestSetupRecoveryPersistsAndExportsEmergencyKit(t *testing.T) {
 		t.Fatal("wallet record does not persist the encrypted Muun key")
 	}
 }
+
+func TestSetupRecoveryRejectsLegacyVersionOneCode(t *testing.T) {
+	manager, err := wallet.NewManager(wallet.Config{
+		DataDir:         t.TempDir(),
+		Passphrase:      "test passphrase",
+		HoustonURL:      "https://houston.example/",
+		PrimaryCurrency: "USD",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = manager.SetupRecovery(context.Background(), "ABCD-EFHJ-KMNP-QRST-UVWX-YZ23-4578-9ABC")
+	if err == nil || !strings.Contains(err.Error(), "version 2") {
+		t.Fatalf("SetupRecovery legacy code error = %v, want version 2 rejection", err)
+	}
+}

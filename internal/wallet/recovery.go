@@ -59,8 +59,12 @@ func (m *Manager) SetupRecovery(ctx context.Context, recoveryCode string) (Recov
 	defer m.recoveryMu.Unlock()
 
 	recoveryCode = strings.TrimSpace(recoveryCode)
-	if err := libwallet.ValidateRecoveryCode(recoveryCode); err != nil {
+	recoveryCodeVersion, err := libwallet.GetRecoveryCodeVersion(recoveryCode)
+	if err != nil {
 		return RecoverySetup{}, fmt.Errorf("validate recovery code: %w", err)
+	}
+	if recoveryCodeVersion != 2 {
+		return RecoverySetup{}, fmt.Errorf("recovery code version %d is not supported; use version 2", recoveryCodeVersion)
 	}
 
 	record, err := m.loadRecord()

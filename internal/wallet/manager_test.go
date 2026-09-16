@@ -12,7 +12,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	libwallet "github.com/muun/libwallet"
 	"github.com/wapu/muun-wrapper/internal/wallet"
@@ -157,6 +159,150 @@ func TestCreateWalletPersistsEncryptedKeyAndReturnsTaprootAddress(t *testing.T) 
 	}
 	if !strings.Contains(string(persisted), "encryptedBasePrivateKey") {
 		t.Fatalf("wallet record does not contain encrypted private key: %s", persisted)
+	}
+}
+
+func TestCreateResumesWhenInitialAddressReservationFails(t *testing.T) {
+	muunKey := mustBaseKey(t, bytes.Repeat([]byte{17}, 32))
+	var initialAddressLookup bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/houston/sessions-v2/first":
+			w.Header().Set("Authorization", "Bearer session-token")
+			writeJSON(t, w, map[string]any{
+				"cosigningPublicKey":  map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+				"swapServerPublicKey": map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+			})
+		case "/houston/user/external-addresses-record":
+			switch r.Method {
+			case http.MethodGet:
+				if !initialAddressLookup {
+					initialAddressLookup = true
+					http.Error(w, "temporary Houston failure", http.StatusServiceUnavailable)
+					return
+				}
+				writeJSON(t, w, map[string]int{"maxUsedIndex": -1, "maxWatchingIndex": 100})
+			case http.MethodPut:
+				writeJSON(t, w, map[string]int{"maxUsedIndex": 0, "maxWatchingIndex": 100})
+			default:
+				t.Fatalf("external address method = %s", r.Method)
+			}
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, err := wallet.NewManager(wallet.Config{
+		DataDir:           t.TempDir(),
+		Passphrase:        "test passphrase",
+		HoustonURL:        server.URL + "/houston/",
+		PrimaryCurrency:   "USD",
+		ClientVersion:     19020002,
+		ClientVersionName: "2.16.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(context.Background()); err == nil {
+		t.Fatal("Create succeeded despite the initial address reservation failure")
+	}
+
+	info, err := manager.Create(context.Background())
+	if err != nil {
+		t.Fatalf("Create retry: %v", err)
+	}
+	if info.AddressIndex != 0 || !strings.HasPrefix(info.Address, "bc1p") {
+		t.Fatalf("Create retry = %#v, want the first Taproot address", info)
+	}
+}
+
+func TestReceiveAddressReservesDistinctAddressesForConcurrentRequests(t *testing.T) {
+	muunKey := mustBaseKey(t, bytes.Repeat([]byte{18}, 32))
+	var recordMu sync.Mutex
+	maxUsedIndex := -1
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/houston/sessions-v2/first":
+			w.Header().Set("Authorization", "Bearer session-token")
+			writeJSON(t, w, map[string]any{
+				"cosigningPublicKey":  map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+				"swapServerPublicKey": map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+			})
+		case "/houston/user/external-addresses-record":
+			switch r.Method {
+			case http.MethodGet:
+				recordMu.Lock()
+				used := maxUsedIndex
+				recordMu.Unlock()
+				time.Sleep(100 * time.Millisecond)
+				writeJSON(t, w, map[string]int{"maxUsedIndex": used, "maxWatchingIndex": 100})
+			case http.MethodPut:
+				var record struct {
+					MaxUsedIndex int `json:"maxUsedIndex"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&record); err != nil {
+					t.Fatal(err)
+				}
+				recordMu.Lock()
+				maxUsedIndex = record.MaxUsedIndex
+				recordMu.Unlock()
+				writeJSON(t, w, map[string]int{"maxUsedIndex": record.MaxUsedIndex, "maxWatchingIndex": 100})
+			default:
+				t.Fatalf("external address method = %s", r.Method)
+			}
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, err := wallet.NewManager(wallet.Config{
+		DataDir:           t.TempDir(),
+		Passphrase:        "test passphrase",
+		HoustonURL:        server.URL + "/houston/",
+		PrimaryCurrency:   "USD",
+		ClientVersion:     19020002,
+		ClientVersionName: "2.16.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan wallet.WalletInfo, 2)
+	errors := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			info, err := manager.ReceiveAddress(context.Background())
+			if err != nil {
+				errors <- err
+				return
+			}
+			results <- info
+		}()
+	}
+	close(start)
+
+	var addresses []wallet.WalletInfo
+	for range 2 {
+		select {
+		case err := <-errors:
+			t.Fatal(err)
+		case info := <-results:
+			addresses = append(addresses, info)
+		case <-time.After(2 * time.Second):
+			t.Fatal("ReceiveAddress did not complete")
+		}
+	}
+	if addresses[0].Address == addresses[1].Address || addresses[0].AddressIndex == addresses[1].AddressIndex {
+		t.Fatalf("concurrent addresses = %#v, want two distinct reservations", addresses)
 	}
 }
 

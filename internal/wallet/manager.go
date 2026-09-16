@@ -83,6 +83,7 @@ type Manager struct {
 	config                  Config
 	client                  *http.Client
 	invoicePool             *walletdb.Pool
+	receiveMu               sync.Mutex
 	sendMu                  sync.Mutex
 	recoveryMu              sync.Mutex
 	signOutgoingTransaction outgoingTransactionSigner
@@ -279,6 +280,13 @@ func (m *Manager) DataDir() string {
 // Create creates the only wallet allowed in the data directory and returns its first receive address.
 func (m *Manager) Create(ctx context.Context) (WalletInfo, error) {
 	if _, err := os.Stat(m.recordPath()); err == nil {
+		record, err := m.loadRecord()
+		if err != nil {
+			return WalletInfo{}, err
+		}
+		if record.MaxUsedAddressIndex < 0 {
+			return m.ReceiveAddress(ctx)
+		}
 		return WalletInfo{}, errors.New("wallet already exists")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return WalletInfo{}, fmt.Errorf("inspect wallet record: %w", err)
@@ -317,6 +325,9 @@ func (m *Manager) Create(ctx context.Context) (WalletInfo, error) {
 
 // ReceiveAddress derives and reserves the next external Taproot address.
 func (m *Manager) ReceiveAddress(ctx context.Context) (WalletInfo, error) {
+	m.receiveMu.Lock()
+	defer m.receiveMu.Unlock()
+
 	record, err := m.loadRecord()
 	if err != nil {
 		return WalletInfo{}, err
