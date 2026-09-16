@@ -12,13 +12,14 @@ con la passphrase configurada.
 ## Inicio
 
 ```bash
-cp .env.example .env
+cp .env.example compose.secrets
 # Reemplazá ambos valores por secretos largos y aleatorios.
-docker compose up --build -d
+./scripts/up.sh
 ```
 
-`LOCAL_UID` y `LOCAL_GID` tienen que coincidir con el propietario de `./data`; por defecto son
-`1000`, que corresponde al entorno de desarrollo actual.
+`LOCAL_UID` y `LOCAL_GID` tienen que coincidir con el propietario de `./data`. Compose usa
+`1000` por defecto; si tu usuario tiene otro UID/GID, iniciá con
+`LOCAL_UID=$(id -u) LOCAL_GID=$(id -g) ./scripts/up.sh`.
 
 La API escucha únicamente en `127.0.0.1:18080` por el mapeo de Compose. Todos los endpoints de
 wallet requieren el token estático:
@@ -126,3 +127,10 @@ la imagen.
 
 El saldo se consulta desde la progresión de UTXOs de Houston. `POST /send` acepta direcciones
 onchain y invoices Lightning con monto fijo. Las invoices sin monto quedan fuera de esta fase.
+
+## Documentación de referencia
+
+La especificación de la API REST, compatible con Swagger UI y otras herramientas OpenAPI, está en
+[`docs/openapi.json`](docs/openapi.json). La referencia de comandos cliente está en
+[`docs/cli.md`](docs/cli.md). Para operar el stack local usá `./scripts/up.sh` y
+`./scripts/down.sh`.
