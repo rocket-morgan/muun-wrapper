@@ -21,6 +21,8 @@ type WalletService interface {
 	ReceiveInvoice(context.Context, *int64) (wallet.Invoice, error)
 	Send(context.Context, wallet.SendRequest) (wallet.SendResult, error)
 	Sync(context.Context) (wallet.SyncResult, error)
+	SetupRecovery(context.Context, string) (wallet.RecoverySetup, error)
+	EmergencyKit(context.Context) (wallet.EmergencyKit, error)
 }
 
 // Server exposes one WalletService behind a static bearer token.
@@ -64,6 +66,10 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.send(writer, request)
 	case request.Method == http.MethodPost && request.URL.Path == "/sync":
 		s.sync(writer, request)
+	case request.Method == http.MethodPost && request.URL.Path == "/recovery/setup":
+		s.setupRecovery(writer, request)
+	case request.Method == http.MethodGet && request.URL.Path == "/recovery/kit":
+		s.emergencyKit(writer, request)
 	default:
 		writeError(writer, http.StatusNotFound, "not found")
 	}
@@ -162,6 +168,34 @@ func (s *Server) send(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	writeJSON(writer, http.StatusCreated, result)
+}
+
+func (s *Server) setupRecovery(writer http.ResponseWriter, request *http.Request) {
+	defer request.Body.Close()
+	var input struct {
+		RecoveryCode string `json:"recoveryCode"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(request.Body, 4<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil || strings.TrimSpace(input.RecoveryCode) == "" {
+		writeError(writer, http.StatusBadRequest, "invalid recovery setup request")
+		return
+	}
+	result, err := s.wallet.SetupRecovery(request.Context(), input.RecoveryCode)
+	if err != nil {
+		writeWalletError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, result)
+}
+
+func (s *Server) emergencyKit(writer http.ResponseWriter, request *http.Request) {
+	kit, err := s.wallet.EmergencyKit(request.Context())
+	if err != nil {
+		writeWalletError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, kit)
 }
 
 func writeWalletError(writer http.ResponseWriter, err error) {

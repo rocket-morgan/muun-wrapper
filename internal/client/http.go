@@ -190,6 +190,67 @@ func (c *Client) Sync(ctx context.Context) (wallet.SyncResult, error) {
 	return result, nil
 }
 
+// SetupRecovery registers a recovery code and prepares a portable emergency kit.
+func (c *Client) SetupRecovery(ctx context.Context, recoveryCode string) (wallet.RecoverySetup, error) {
+	payload, err := json.Marshal(struct {
+		RecoveryCode string `json:"recoveryCode"`
+	}{RecoveryCode: recoveryCode})
+	if err != nil {
+		return wallet.RecoverySetup{}, fmt.Errorf("encode recovery setup request: %w", err)
+	}
+	endpoint := c.baseURL.ResolveReference(&url.URL{Path: "recovery/setup"})
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(payload))
+	if err != nil {
+		return wallet.RecoverySetup{}, fmt.Errorf("build API request: %w", err)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+c.token)
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return wallet.RecoverySetup{}, fmt.Errorf("call wrapper API: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		return wallet.RecoverySetup{}, fmt.Errorf("wrapper API returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+
+	var result wallet.RecoverySetup
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return wallet.RecoverySetup{}, fmt.Errorf("decode API response: %w", err)
+	}
+	return result, nil
+}
+
+// EmergencyKit returns the encrypted recovery material previously created by SetupRecovery.
+func (c *Client) EmergencyKit(ctx context.Context) (wallet.EmergencyKit, error) {
+	endpoint := c.baseURL.ResolveReference(&url.URL{Path: "recovery/kit"})
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return wallet.EmergencyKit{}, fmt.Errorf("build API request: %w", err)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Authorization", "Bearer "+c.token)
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return wallet.EmergencyKit{}, fmt.Errorf("call wrapper API: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		return wallet.EmergencyKit{}, fmt.Errorf("wrapper API returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+
+	var result wallet.EmergencyKit
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return wallet.EmergencyKit{}, fmt.Errorf("decode API response: %w", err)
+	}
+	return result, nil
+}
+
 func (c *Client) doWalletInfo(ctx context.Context, method, path string) (wallet.WalletInfo, error) {
 	endpoint := c.baseURL.ResolveReference(&url.URL{Path: path})
 	request, err := http.NewRequestWithContext(ctx, method, endpoint.String(), nil)

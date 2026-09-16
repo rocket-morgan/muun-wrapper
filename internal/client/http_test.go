@@ -217,6 +217,74 @@ func TestSendUsesAuthenticatedAPI(t *testing.T) {
 	}
 }
 
+func TestSetupRecoveryUsesAuthenticatedAPI(t *testing.T) {
+	want := wallet.RecoverySetup{RecoveryCodeChecksum: "checksum", VerificationCode: "verify"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/recovery/setup" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer api-token" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var request struct {
+			RecoveryCode string `json:"recoveryCode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.RecoveryCode != "ABCD-EFGH" {
+			t.Fatalf("recovery code = %q", request.RecoveryCode)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(want); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	defer server.Close()
+
+	api, err := New(server.URL, "api-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := api.SetupRecovery(context.Background(), "ABCD-EFGH")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != want {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestEmergencyKitUsesAuthenticatedAPI(t *testing.T) {
+	want := wallet.EmergencyKit{Version: 3, FirstEncryptedKey: "user-key", SecondEncryptedKey: "muun-key", VerificationCode: "verify"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/recovery/kit" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer api-token" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(want); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	defer server.Close()
+
+	api, err := New(server.URL, "api-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := api.EmergencyKit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != want {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func writeWalletInfo(t *testing.T, writer http.ResponseWriter, status int, info wallet.WalletInfo) {
 	t.Helper()
 	writer.Header().Set("Content-Type", "application/json")

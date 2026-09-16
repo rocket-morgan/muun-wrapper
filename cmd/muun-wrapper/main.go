@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	libwallet "github.com/muun/libwallet"
 	"github.com/wapu/muun-wrapper/internal/api"
 	"github.com/wapu/muun-wrapper/internal/client"
 	"github.com/wapu/muun-wrapper/internal/wallet"
@@ -31,13 +32,16 @@ func main() {
 
 func run(args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: muun-wrapper <server|create|address|balance|operations|invoice|send|sync>")
+		return errors.New("usage: muun-wrapper <server|create|address|balance|operations|invoice|send|sync|recovery-code|recovery-setup|emergency-kit>")
 	}
 
 	switch args[0] {
 	case "server":
 		return runServer()
-	case "create", "address", "balance", "operations", "invoice", "send", "sync":
+	case "recovery-code":
+		_, err := fmt.Fprintln(output, libwallet.GenerateRecoveryCode())
+		return err
+	case "create", "address", "balance", "operations", "invoice", "send", "sync", "recovery-setup", "emergency-kit":
 		return runClientCommand(args[0], args[1:], output)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
@@ -52,6 +56,7 @@ func runClientCommand(command string, args []string, output io.Writer) error {
 	amountSatoshis := flags.Int64("amount-sats", 0, "amount for a Lightning invoice in satoshis")
 	destination := flags.String("destination", "", "Bitcoin payment destination")
 	description := flags.String("description", "", "payment description")
+	recoveryCodeFile := flags.String("recovery-code-file", "", "path to a recovery code file")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -90,6 +95,20 @@ func runClientCommand(command string, args []string, output io.Writer) error {
 		})
 	case "sync":
 		result, err = apiClient.Sync(ctx)
+	case "recovery-setup":
+		if strings.TrimSpace(*recoveryCodeFile) == "" {
+			return errors.New("recovery-setup requires --recovery-code-file")
+		}
+		recoveryCode, readErr := os.ReadFile(*recoveryCodeFile)
+		if readErr != nil {
+			return fmt.Errorf("read recovery code file: %w", readErr)
+		}
+		if strings.TrimSpace(string(recoveryCode)) == "" {
+			return errors.New("recovery code file is empty")
+		}
+		result, err = apiClient.SetupRecovery(ctx, strings.TrimSpace(string(recoveryCode)))
+	case "emergency-kit":
+		result, err = apiClient.EmergencyKit(ctx)
 	}
 	if err != nil {
 		return err

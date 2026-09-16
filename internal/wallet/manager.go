@@ -84,6 +84,7 @@ type Manager struct {
 	client                  *http.Client
 	invoicePool             *walletdb.Pool
 	sendMu                  sync.Mutex
+	recoveryMu              sync.Mutex
 	signOutgoingTransaction outgoingTransactionSigner
 }
 
@@ -94,6 +95,11 @@ type walletRecord struct {
 	MuunCosigningPublicKey  string `json:"muunCosigningPublicKey"`
 	SwapServerPublicKey     string `json:"swapServerPublicKey"`
 	SessionToken            string `json:"sessionToken"`
+	RecoveryCodePublicKey   string `json:"recoveryCodePublicKey,omitempty"`
+	RecoveryCodeSalt        string `json:"recoveryCodeSalt,omitempty"`
+	EmergencyKitUserKey     string `json:"emergencyKitUserKey,omitempty"`
+	EmergencyKitMuunKey     string `json:"emergencyKitMuunKey,omitempty"`
+	EmergencyKitMuunKeyFP   string `json:"emergencyKitMuunKeyFingerprint,omitempty"`
 	MaxUsedAddressIndex     int    `json:"maxUsedAddressIndex"`
 	MaxWatchingAddressIndex int    `json:"maxWatchingAddressIndex"`
 }

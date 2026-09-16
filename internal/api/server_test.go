@@ -203,30 +203,84 @@ func TestSendSubmitsAuthenticatedPayment(t *testing.T) {
 	}
 }
 
+func TestRecoverySetupRegistersAuthenticatedRecoveryCode(t *testing.T) {
+	t.Parallel()
+	service := &fakeWallet{recoverySetupResult: wallet.RecoverySetup{RecoveryCodeChecksum: "checksum", VerificationCode: "verify"}}
+	server := NewServer(service, "api-token")
+
+	request := httptest.NewRequest(http.MethodPost, "/recovery/setup", strings.NewReader(`{"recoveryCode":"ABCD-EFGH"}`))
+	request.Header.Set("Authorization", "Bearer api-token")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated || service.recoverySetupCalls != 1 {
+		t.Fatalf("status=%d recoverySetupCalls=%d", response.Code, service.recoverySetupCalls)
+	}
+	if service.recoveryCode != "ABCD-EFGH" {
+		t.Fatalf("recovery code = %q", service.recoveryCode)
+	}
+	var body wallet.RecoverySetup
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body != service.recoverySetupResult {
+		t.Fatalf("response = %#v", body)
+	}
+}
+
+func TestEmergencyKitExportsAuthenticatedMaterial(t *testing.T) {
+	t.Parallel()
+	service := &fakeWallet{emergencyKitResult: wallet.EmergencyKit{Version: 3, FirstEncryptedKey: "user-key", SecondEncryptedKey: "muun-key", VerificationCode: "verify"}}
+	server := NewServer(service, "api-token")
+
+	request := httptest.NewRequest(http.MethodGet, "/recovery/kit", nil)
+	request.Header.Set("Authorization", "Bearer api-token")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || service.emergencyKitCalls != 1 {
+		t.Fatalf("status=%d emergencyKitCalls=%d", response.Code, service.emergencyKitCalls)
+	}
+	var body wallet.EmergencyKit
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body != service.emergencyKitResult {
+		t.Fatalf("response = %#v", body)
+	}
+}
+
 type fakeWallet struct {
-	createCalls      int
-	receiveCalls     int
-	balanceCalls     int
-	operationsCalls  int
-	invoiceCalls     int
-	syncCalls        int
-	sendCalls        int
-	createResult     wallet.WalletInfo
-	receiveResult    wallet.WalletInfo
-	balanceResult    wallet.Balance
-	operationsResult []wallet.Operation
-	invoiceResult    wallet.Invoice
-	syncResult       wallet.SyncResult
-	sendResult       wallet.SendResult
-	createErr        error
-	receiveErr       error
-	balanceErr       error
-	operationsErr    error
-	invoiceErr       error
-	syncErr          error
-	sendErr          error
-	invoiceAmount    *int64
-	sendRequest      wallet.SendRequest
+	createCalls         int
+	receiveCalls        int
+	balanceCalls        int
+	operationsCalls     int
+	invoiceCalls        int
+	syncCalls           int
+	sendCalls           int
+	recoverySetupCalls  int
+	emergencyKitCalls   int
+	createResult        wallet.WalletInfo
+	receiveResult       wallet.WalletInfo
+	balanceResult       wallet.Balance
+	operationsResult    []wallet.Operation
+	invoiceResult       wallet.Invoice
+	syncResult          wallet.SyncResult
+	sendResult          wallet.SendResult
+	recoverySetupResult wallet.RecoverySetup
+	emergencyKitResult  wallet.EmergencyKit
+	createErr           error
+	receiveErr          error
+	balanceErr          error
+	operationsErr       error
+	invoiceErr          error
+	syncErr             error
+	sendErr             error
+	recoverySetupErr    error
+	emergencyKitErr     error
+	invoiceAmount       *int64
+	sendRequest         wallet.SendRequest
+	recoveryCode        string
 }
 
 func (w *fakeWallet) Create(context.Context) (wallet.WalletInfo, error) {
@@ -264,4 +318,15 @@ func (w *fakeWallet) Send(_ context.Context, request wallet.SendRequest) (wallet
 	w.sendCalls++
 	w.sendRequest = request
 	return w.sendResult, w.sendErr
+}
+
+func (w *fakeWallet) SetupRecovery(_ context.Context, recoveryCode string) (wallet.RecoverySetup, error) {
+	w.recoverySetupCalls++
+	w.recoveryCode = recoveryCode
+	return w.recoverySetupResult, w.recoverySetupErr
+}
+
+func (w *fakeWallet) EmergencyKit(context.Context) (wallet.EmergencyKit, error) {
+	w.emergencyKitCalls++
+	return w.emergencyKitResult, w.emergencyKitErr
 }

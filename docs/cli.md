@@ -4,7 +4,7 @@ El binario `muun-wrapper` tiene un modo servidor y un cliente HTTP. El servicio 
 ejecuta `server`; los demás comandos consumen la API protegida por el token estático.
 
 ```bash
-muun-wrapper <server|create|address|balance|operations|invoice|send|sync>
+muun-wrapper <server|create|address|balance|operations|invoice|send|sync|recovery-code|recovery-setup|emergency-kit>
 ```
 
 Los comandos cliente aceptan estas opciones:
@@ -18,9 +18,8 @@ Al usar Compose, ejecutá el cliente dentro del contenedor para que use el token
 copiarlo al historial del shell:
 
 ```bash
-docker compose exec muun-wrapper muun-wrapper balance \
-  --api-url http://127.0.0.1:8080 \
-  --api-token "$MUUN_WRAPPER_API_TOKEN"
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper balance --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"'
 ```
 
 ## Comandos
@@ -34,6 +33,9 @@ docker compose exec muun-wrapper muun-wrapper balance \
 | `invoice` | Crea una invoice BOLT11 para recibir Lightning. | `--amount-sats N` |
 | `send` | Envía a una dirección Bitcoin o una invoice BOLT11 con monto fijo. | `--destination DESTINO`, `--amount-sats N` |
 | `sync` | Liquida los incoming swaps Lightning pendientes. | — |
+| `recovery-code` | Genera una recovery code nueva. No usa la API ni la persiste. | — |
+| `recovery-setup` | Registra una recovery code y prepara el emergency kit. | `--recovery-code-file ARCHIVO` |
+| `emergency-kit` | Imprime el export JSON del emergency kit ya configurado. | — |
 
 `send` acepta `--description TEXTO` de forma opcional. La comisión incluida en su salida es la
 fee de red; el historial puede mostrar además la deuda pendiente de swaps que Houston liquida al
@@ -42,20 +44,45 @@ gastar UTXOs.
 ## Ejemplos
 
 ```bash
-docker compose exec muun-wrapper muun-wrapper address \
-  --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper address --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"'
 
-docker compose exec muun-wrapper muun-wrapper invoice \
-  --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" \
-  --amount-sats 1000
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper invoice --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --amount-sats 1000'
 
-docker compose exec muun-wrapper muun-wrapper send \
-  --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" \
-  --destination lnbc... --amount-sats 1000 --description "prueba Lightning"
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper send --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --destination lnbc... --amount-sats 1000 --description "prueba Lightning"'
 
-docker compose exec muun-wrapper muun-wrapper sync \
-  --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper sync --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"'
 ```
+
+## Recovery code y emergency kit
+
+La code da acceso a las claves cifradas del kit: guardala offline y no la agregues a la shell, a
+un repositorio ni al directorio `data`. El CLI no la persiste. `recovery-setup` la lee de un
+archivo, por lo que puede recibirla desde `/dev/stdin` dentro del contenedor.
+
+```bash
+mkdir -p secrets
+chmod 700 secrets
+
+docker compose exec -T muun-wrapper muun-wrapper recovery-code \
+  > secrets/recovery-code.txt
+chmod 600 secrets/recovery-code.txt
+
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper recovery-setup --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --recovery-code-file /dev/stdin' \
+  < secrets/recovery-code.txt
+
+umask 077
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper emergency-kit --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"' \
+  > secrets/emergency-kit.json
+```
+
+El JSON incluye las dos claves cifradas, fingerprints, checksum, HTML imprimible y metadata para
+PDF. Conservá ese archivo separado de la recovery code.
 
 ## Servidor
 

@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	libwallet "github.com/muun/libwallet"
 	"github.com/wapu/muun-wrapper/internal/wallet"
 )
 
@@ -227,6 +231,79 @@ func TestRunSendPrintsSubmittedPayment(t *testing.T) {
 	}
 }
 
+func TestRunRecoveryCodePrintsValidCode(t *testing.T) {
+	t.Parallel()
+	var output bytes.Buffer
+	if err := run([]string{"recovery-code"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if err := libwallet.ValidateRecoveryCode(strings.TrimSpace(output.String())); err != nil {
+		t.Fatalf("invalid recovery code %q: %v", output.String(), err)
+	}
+}
+
+func TestRunRecoverySetupReadsCodeFromFile(t *testing.T) {
+	t.Parallel()
+	codePath := filepath.Join(t.TempDir(), "recovery-code.txt")
+	if err := os.WriteFile(codePath, []byte("ABCD-EFGH\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/recovery/setup" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var request struct {
+			RecoveryCode string `json:"recoveryCode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.RecoveryCode != "ABCD-EFGH" {
+			t.Fatalf("recovery code = %q", request.RecoveryCode)
+		}
+		writeRecoverySetup(t, w, http.StatusCreated, wallet.RecoverySetup{RecoveryCodeChecksum: "checksum", VerificationCode: "verify"})
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	err := run([]string{"recovery-setup", "--api-url", server.URL, "--api-token", "api-token", "--recovery-code-file", codePath}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result wallet.RecoverySetup
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.VerificationCode != "verify" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestRunEmergencyKitPrintsExportReturnedByAPI(t *testing.T) {
+	t.Parallel()
+	want := wallet.EmergencyKit{Version: 3, FirstEncryptedKey: "user-key", SecondEncryptedKey: "muun-key", VerificationCode: "verify"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/recovery/kit" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		writeEmergencyKit(t, w, http.StatusOK, want)
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	err := run([]string{"emergency-kit", "--api-url", server.URL, "--api-token", "api-token"}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result wallet.EmergencyKit
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result != want {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestSyncIntervalReadsConfiguredDuration(t *testing.T) {
 	t.Setenv("MUUN_WRAPPER_SYNC_INTERVAL", "45s")
 	interval, err := syncInterval()
@@ -282,6 +359,24 @@ func writeInvoice(t *testing.T, writer http.ResponseWriter, status int, invoice 
 }
 
 func writeSyncResult(t *testing.T, writer http.ResponseWriter, status int, result wallet.SyncResult) {
+	t.Helper()
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	if err := json.NewEncoder(writer).Encode(result); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeRecoverySetup(t *testing.T, writer http.ResponseWriter, status int, result wallet.RecoverySetup) {
+	t.Helper()
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	if err := json.NewEncoder(writer).Encode(result); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeEmergencyKit(t *testing.T, writer http.ResponseWriter, status int, result wallet.EmergencyKit) {
 	t.Helper()
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(status)

@@ -165,6 +165,51 @@
           "401": { "$ref": "#/components/responses/Error" }
         }
       }
+    },
+    "/recovery/setup": {
+      "post": {
+        "operationId": "setupRecovery",
+        "summary": "Registra una recovery code y prepara el emergency kit",
+        "description": "La recovery code no se persiste ni se incluye en la respuesta.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RecoverySetupRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Recovery code registrada y kit preparado",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RecoverySetup" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/recovery/kit": {
+      "get": {
+        "operationId": "getEmergencyKit",
+        "summary": "Exporta el emergency kit configurado",
+        "responses": {
+          "200": {
+            "description": "Material de recuperación cifrado",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EmergencyKit" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
     }
   },
   "components": {
@@ -249,6 +294,36 @@
         "type": "object",
         "required": ["fulfilledIncomingSwaps"],
         "properties": { "fulfilledIncomingSwaps": { "type": "integer", "minimum": 0 } }
+      },
+      "RecoverySetupRequest": {
+        "type": "object",
+        "required": ["recoveryCode"],
+        "properties": {
+          "recoveryCode": { "type": "string", "description": "Recovery code generada por el CLI" }
+        }
+      },
+      "RecoverySetup": {
+        "type": "object",
+        "required": ["recoveryCodeChecksum", "verificationCode"],
+        "properties": {
+          "recoveryCodeChecksum": { "type": "string" },
+          "verificationCode": { "type": "string" }
+        }
+      },
+      "EmergencyKit": {
+        "type": "object",
+        "required": ["version", "firstEncryptedKey", "firstFingerprint", "secondEncryptedKey", "secondFingerprint", "recoveryCodeChecksum", "verificationCode", "html", "metadata"],
+        "properties": {
+          "version": { "type": "integer", "example": 3 },
+          "firstEncryptedKey": { "type": "string", "description": "Clave de usuario cifrada por la recovery code" },
+          "firstFingerprint": { "type": "string" },
+          "secondEncryptedKey": { "type": "string", "description": "Clave de Muun cifrada por la recovery code" },
+          "secondFingerprint": { "type": "string" },
+          "recoveryCodeChecksum": { "type": "string" },
+          "verificationCode": { "type": "string" },
+          "html": { "type": "string", "description": "Emergency kit imprimible" },
+          "metadata": { "type": "string", "description": "Metadata para adjuntar al PDF" }
+        }
       },
       "Operation": {
         "type": "object",
