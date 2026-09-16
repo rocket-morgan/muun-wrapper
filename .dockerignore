@@ -1,0 +1,7 @@
+.git
+.cache
+data
+.env
+Dockerfile.test
+specs
+compose.secrets
