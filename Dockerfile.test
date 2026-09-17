@@ -1,0 +1,18 @@
+FROM golang:1.24-bookworm
+
+ARG APOLLO_COMMIT=e5f5e1bb54f611ef457c56207f2a34ac85b00827
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone https://github.com/muun/apollo.git /deps/apollo \
+    && git -C /deps/apollo checkout --detach "$APOLLO_COMMIT"
+
+WORKDIR /src
+
+COPY . .
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod edit -replace github.com/muun/libwallet=/deps/apollo/libwallet \
+    && go test -mod=mod ./...

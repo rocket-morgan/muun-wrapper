@@ -12,16 +12,25 @@ con la passphrase configurada.
 ## Inicio
 
 ```bash
-cp .env.example .env
+cp .env.example compose.secrets
 # Reemplazá ambos valores por secretos largos y aleatorios.
-docker compose up --build -d
+./scripts/up.sh
 ```
 
-`LOCAL_UID` y `LOCAL_GID` tienen que coincidir con el propietario de `./data`; por defecto son
-`1000`, que corresponde al entorno de desarrollo actual.
+`LOCAL_UID` y `LOCAL_GID` tienen que coincidir con el propietario de `./data`. Compose usa
+`1000` por defecto; si tu usuario tiene otro UID/GID, iniciá con
+`LOCAL_UID=$(id -u) LOCAL_GID=$(id -g) ./scripts/up.sh`.
 
 La API escucha únicamente en `127.0.0.1:18080` por el mapeo de Compose. Todos los endpoints de
-wallet requieren el token estático:
+wallet requieren el token estático. Para usar `curl` desde el host, cargá el mismo token que
+configuraste en `compose.secrets` sin dejarlo en el historial:
+
+```bash
+read -r -s -p "API token: " MUUN_WRAPPER_API_TOKEN; echo
+export MUUN_WRAPPER_API_TOKEN
+```
+
+Después ejecutá los endpoints:
 
 ```bash
 curl -X POST http://127.0.0.1:18080/wallet/create \
@@ -69,46 +78,61 @@ dirección Bitcoin o una invoice Lightning BOLT11 con monto fijo, más `amountSa
 firma y publica la transacción. En Lightning crea un submarine swap v2, lo valida contra la invoice
 y publica la transacción de funding; si Houston presta el monto, no hay transacción onchain.
 
+## Emergency Kit
+
+La recovery code no se guarda en la wallet ni se devuelve por la API. Generala una vez, guardala
+fuera del directorio de datos y usala desde entrada estándar para registrarla. El kit resultante
+contiene material cifrado por esa code; guardalo con permisos restrictivos junto con la code, pero
+en ubicaciones separadas.
+
+```bash
+mkdir -p secrets
+chmod 700 secrets
+
+docker compose exec -T muun-wrapper muun-wrapper recovery-code \
+  > secrets/recovery-code.txt
+chmod 600 secrets/recovery-code.txt
+
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper recovery-setup --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --recovery-code-file /dev/stdin' \
+  < secrets/recovery-code.txt
+
+umask 077
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper emergency-kit --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"' \
+  > secrets/emergency-kit.json
+```
+
+`POST /recovery/setup` registra la code con Houston y crea el material de recuperación.
+`GET /recovery/kit` devuelve el export como JSON, con sus claves cifradas, HTML imprimible y
+metadata para PDF. La code nunca forma parte de esa respuesta.
+
 El mismo binario incluye los comandos cliente:
 
 ```bash
-docker compose exec muun-wrapper muun-wrapper create \
-  --api-url http://127.0.0.1:18080 \
-  --api-token "$MUUN_WRAPPER_API_TOKEN"
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper create --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"'
 
-docker compose exec muun-wrapper muun-wrapper address \
-  --api-url http://127.0.0.1:18080 \
-  --api-token "$MUUN_WRAPPER_API_TOKEN"
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper address --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"'
 
-docker compose exec muun-wrapper muun-wrapper balance \
-  --api-url http://127.0.0.1:18080 \
-  --api-token "$MUUN_WRAPPER_API_TOKEN"
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper balance --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"'
 
-docker compose exec muun-wrapper muun-wrapper operations \
-  --api-url http://127.0.0.1:18080 \
-  --api-token "$MUUN_WRAPPER_API_TOKEN"
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper operations --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"'
 
-docker compose exec muun-wrapper muun-wrapper invoice \
-  --api-url http://127.0.0.1:18080 \
-  --api-token "$MUUN_WRAPPER_API_TOKEN" \
-  --amount-sats 2500
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper invoice --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --amount-sats 2500'
 
-docker compose exec muun-wrapper muun-wrapper sync \
-  --api-url http://127.0.0.1:18080 \
-  --api-token "$MUUN_WRAPPER_API_TOKEN"
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper sync --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"'
 
-docker compose exec muun-wrapper muun-wrapper send \
-  --api-url http://127.0.0.1:18080 \
-  --api-token "$MUUN_WRAPPER_API_TOKEN" \
-  --destination bc1qexample \
-  --amount-sats 10000 \
-  --description onchain
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper send --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --destination bc1qexample --amount-sats 10000 --description onchain'
 
-docker compose exec muun-wrapper muun-wrapper send \
-  --api-url http://127.0.0.1:18080 \
-  --api-token "$MUUN_WRAPPER_API_TOKEN" \
-  --destination lnbc... \
-  --amount-sats 2500
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper send --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --destination lnbc... --amount-sats 2500'
 ```
 
 ## Desarrollo y verificación
@@ -126,3 +150,10 @@ la imagen.
 
 El saldo se consulta desde la progresión de UTXOs de Houston. `POST /send` acepta direcciones
 onchain y invoices Lightning con monto fijo. Las invoices sin monto quedan fuera de esta fase.
+
+## Documentación de referencia
+
+La especificación de la API REST, compatible con Swagger UI y otras herramientas OpenAPI, está en
+[`docs/openapi.json`](docs/openapi.json). La referencia de comandos cliente está en
+[`docs/cli.md`](docs/cli.md). Para operar el stack local usá `./scripts/up.sh` y
+`./scripts/down.sh`.
