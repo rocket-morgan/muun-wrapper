@@ -53,6 +53,9 @@ curl -X POST http://127.0.0.1:18080/receive/invoice \
 curl -X POST http://127.0.0.1:18080/sync \
   -H "Authorization: Bearer $MUUN_WRAPPER_API_TOKEN"
 
+curl http://127.0.0.1:18080/invoices/<paymentHash> \
+  -H "Authorization: Bearer $MUUN_WRAPPER_API_TOKEN"
+
 curl -X POST http://127.0.0.1:18080/send \
   -H "Authorization: Bearer $MUUN_WRAPPER_API_TOKEN" \
   -H "Content-Type: application/json" \
@@ -71,6 +74,14 @@ el último UTXO de su progresión menos la deuda esperada. `GET /healthz` no req
 `GET /operations` devuelve el historial actual con dirección, estado, monto, fee, hash y
 confirmaciones cuando existen. `POST /receive/invoice` recibe `amountSatoshis`, registra los
 secretos necesarios con Houston y devuelve una invoice Lightning BOLT11 por ese monto.
+`POST /receive/invoice` devuelve además el `paymentHash` de la invoice.
+`GET /invoices/{paymentHash}` informa si esa invoice ya fue pagada. Responde sólo por invoices que
+emitió esta wallet: un payment hash desconocido devuelve `404` en vez de un "no pagado"
+indefinido. El campo `state` vale `pending` (sin pago reportado), `receiving` (el pago llegó pero
+su incoming swap no está liquidado, así que no hay preimage y los fondos no son gastables) o
+`settled` (el preimage prueba el pago). Es idempotente: no dispara sincronización. `GET /operations`
+incluye `paymentHash` y `preimage` en los incoming swaps, para correlacionar operaciones con
+invoices.
 `POST /sync` busca incoming swaps pendientes en la historia de Houston y los liquida; ejecutalo
 después de pagar una invoice si no querés esperar al poller. El servidor también sincroniza al
 iniciar y cada `MUUN_WRAPPER_SYNC_INTERVAL` (20 segundos por defecto). `POST /send` recibe una

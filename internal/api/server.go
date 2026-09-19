@@ -19,6 +19,7 @@ type WalletService interface {
 	Balance(context.Context) (wallet.Balance, error)
 	Operations(context.Context) ([]wallet.Operation, error)
 	ReceiveInvoice(context.Context, *int64) (wallet.Invoice, error)
+	InvoiceStatus(context.Context, string) (wallet.InvoiceStatus, error)
 	Send(context.Context, wallet.SendRequest) (wallet.SendResult, error)
 	Sync(context.Context) (wallet.SyncResult, error)
 	SetupRecovery(context.Context, string) (wallet.RecoverySetup, error)
@@ -70,6 +71,12 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.setupRecovery(writer, request)
 	case request.Method == http.MethodGet && request.URL.Path == "/recovery/kit":
 		s.emergencyKit(writer, request)
+	case strings.HasPrefix(request.URL.Path, invoicesPrefix):
+		if request.Method != http.MethodGet {
+			methodNotAllowed(writer)
+			return
+		}
+		s.invoiceStatus(writer, request)
 	default:
 		writeError(writer, http.StatusNotFound, "not found")
 	}
@@ -142,6 +149,27 @@ func (s *Server) receiveInvoice(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	writeJSON(writer, http.StatusCreated, invoice)
+}
+
+// invoicesPrefix is matched by prefix because this is the only route with a path parameter.
+const invoicesPrefix = "/invoices/"
+
+func (s *Server) invoiceStatus(writer http.ResponseWriter, request *http.Request) {
+	paymentHash := strings.TrimPrefix(request.URL.Path, invoicesPrefix)
+	if paymentHash == "" || strings.Contains(paymentHash, "/") {
+		writeError(writer, http.StatusBadRequest, "invoice status needs one payment hash in the path")
+		return
+	}
+	status, err := s.wallet.InvoiceStatus(request.Context(), paymentHash)
+	if errors.Is(err, wallet.ErrUnknownPaymentHash) {
+		writeError(writer, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		writeWalletError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, status)
 }
 
 func (s *Server) sync(writer http.ResponseWriter, request *http.Request) {

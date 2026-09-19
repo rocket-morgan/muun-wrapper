@@ -32,7 +32,7 @@ func main() {
 
 func run(args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: muun-wrapper <server|create|address|balance|operations|invoice|send|sync|recovery-code|recovery-setup|emergency-kit>")
+		return errors.New("usage: muun-wrapper <server|create|address|balance|operations|invoice|invoice-status|send|sync|recovery-code|recovery-setup|emergency-kit>")
 	}
 
 	switch args[0] {
@@ -41,7 +41,7 @@ func run(args []string, output io.Writer) error {
 	case "recovery-code":
 		_, err := fmt.Fprintln(output, libwallet.GenerateRecoveryCode())
 		return err
-	case "create", "address", "balance", "operations", "invoice", "send", "sync", "recovery-setup", "emergency-kit":
+	case "create", "address", "balance", "operations", "invoice", "invoice-status", "send", "sync", "recovery-setup", "emergency-kit":
 		return runClientCommand(args[0], args[1:], output)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
@@ -57,6 +57,7 @@ func runClientCommand(command string, args []string, output io.Writer) error {
 	destination := flags.String("destination", "", "Bitcoin payment destination")
 	description := flags.String("description", "", "payment description")
 	recoveryCodeFile := flags.String("recovery-code-file", "", "path to a recovery code file")
+	paymentHash := flags.String("payment-hash", "", "payment hash of an issued Lightning invoice")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -81,6 +82,11 @@ func runClientCommand(command string, args []string, output io.Writer) error {
 			return errors.New("invoice requires --amount-sats greater than zero")
 		}
 		result, err = apiClient.ReceiveInvoice(ctx, amountSatoshis)
+	case "invoice-status":
+		if *paymentHash == "" {
+			return errors.New("invoice-status requires --payment-hash")
+		}
+		result, err = apiClient.InvoiceStatus(ctx, *paymentHash)
 	case "send":
 		if strings.TrimSpace(*destination) == "" {
 			return errors.New("send requires --destination")

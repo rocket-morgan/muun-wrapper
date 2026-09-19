@@ -4,7 +4,7 @@ El binario `muun-wrapper` tiene un modo servidor y un cliente HTTP. El servicio 
 ejecuta `server`; los demás comandos consumen la API protegida por el token estático.
 
 ```bash
-muun-wrapper <server|create|address|balance|operations|invoice|send|sync|recovery-code|recovery-setup|emergency-kit>
+muun-wrapper <server|create|address|balance|operations|invoice|invoice-status|send|sync|recovery-code|recovery-setup|emergency-kit>
 ```
 
 Los comandos cliente aceptan estas opciones:
@@ -30,12 +30,24 @@ docker compose exec -T muun-wrapper sh -c \
 | `address` | Reserva y devuelve una nueva dirección onchain Taproot. | — |
 | `balance` | Devuelve el saldo gastable en satoshis. | — |
 | `operations` | Lista las operaciones informadas por Houston. | — |
-| `invoice` | Crea una invoice BOLT11 para recibir Lightning. | `--amount-sats N` |
+| `invoice` | Crea una invoice BOLT11 para recibir Lightning. Devuelve también su `paymentHash`. | `--amount-sats N` |
+| `invoice-status` | Informa si una invoice emitida ya fue pagada. | `--payment-hash HEX` |
 | `send` | Envía a una dirección Bitcoin o una invoice BOLT11 con monto fijo. | `--destination DESTINO`, `--amount-sats N` |
 | `sync` | Liquida los incoming swaps Lightning pendientes. | — |
 | `recovery-code` | Genera una recovery code nueva. No usa la API ni la persiste. | — |
 | `recovery-setup` | Registra una recovery code y prepara el emergency kit. | `--recovery-code-file ARCHIVO` |
 | `emergency-kit` | Imprime el export JSON del emergency kit ya configurado. | — |
+
+`invoice-status` responde sólo por invoices que emitió esta wallet: un payment hash desconocido
+devuelve un error en vez de un "no pagado" indefinido. Devuelve tres estados:
+
+| `state` | Significado |
+| --- | --- |
+| `pending` | La invoice es de esta wallet y Houston todavía no reporta el pago. |
+| `receiving` | El pago llegó pero su incoming swap no está liquidado: no hay preimage y los fondos no son gastables. El poller lo liquida cada `MUUN_WRAPPER_SYNC_INTERVAL`, o forzalo con `sync`. |
+| `settled` | El swap está liquidado y el preimage prueba el pago. |
+
+Comparar `receivedSatoshis` con `amountSatoshis` permite detectar un monto distinto al pedido.
 
 `send` acepta `--description TEXTO` de forma opcional. La comisión incluida en su salida es la
 fee de red; el historial puede mostrar además la deuda pendiente de swaps que Houston liquida al
@@ -55,6 +67,9 @@ docker compose exec -T muun-wrapper sh -c \
 
 docker compose exec -T muun-wrapper sh -c \
   'muun-wrapper sync --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN"'
+
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper invoice-status --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --payment-hash 8f3a...'
 ```
 
 ## Recovery code y emergency kit

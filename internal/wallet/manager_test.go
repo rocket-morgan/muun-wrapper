@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -709,4 +710,216 @@ func contains(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+// TestInvoiceStatusTracksSettlementOfAnIssuedInvoice walks one issued invoice through every state
+// the API can report, and checks that a hash this wallet never issued is rejected instead of being
+// reported as simply unpaid.
+func TestInvoiceStatusTracksSettlementOfAnIssuedInvoice(t *testing.T) {
+	muunKey := mustBaseKey(t, bytes.Repeat([]byte{12}, 32))
+	amount := int64(2_500)
+	preimage := strings.Repeat("cd", 32)
+
+	var operationsMu sync.Mutex
+	operations := []map[string]any{}
+	setOperations := func(value []map[string]any) {
+		operationsMu.Lock()
+		defer operationsMu.Unlock()
+		operations = value
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/houston/sessions-v2/first":
+			w.Header().Set("Authorization", "Bearer session-token")
+			writeJSON(t, w, map[string]any{
+				"cosigningPublicKey":  map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+				"swapServerPublicKey": map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+			})
+		case "/houston/user/external-addresses-record":
+			switch r.Method {
+			case http.MethodGet:
+				writeJSON(t, w, map[string]int{"maxUsedIndex": -1, "maxWatchingIndex": 100})
+			default:
+				writeJSON(t, w, map[string]int{"maxUsedIndex": 0, "maxWatchingIndex": 100})
+			}
+		case "/houston/realtime":
+			writeJSON(t, w, map[string]any{
+				"forwardingPolicies": []map[string]any{{
+					"identityKeyHex":            hex.EncodeToString(muunKey.PublicKey().Raw()),
+					"feeBaseMsat":               1_000,
+					"feeProportionalMillionths": 1_000,
+					"cltvExpiryDelta":           72,
+				}},
+			})
+		case "/houston/incoming-swaps/invoices":
+			w.WriteHeader(http.StatusNoContent)
+		case "/houston/operations":
+			operationsMu.Lock()
+			defer operationsMu.Unlock()
+			writeJSON(t, w, operations)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, err := wallet.NewManager(wallet.Config{
+		DataDir:           t.TempDir(),
+		Passphrase:        "test passphrase",
+		HoustonURL:        server.URL + "/houston/",
+		PrimaryCurrency:   "USD",
+		ClientVersion:     1511,
+		ClientVersionName: "55.11",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	invoice, err := manager.ReceiveInvoice(context.Background(), &amount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := libwallet.ParseInvoice(invoice.Invoice, libwallet.Mainnet())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invoice.PaymentHash != hex.EncodeToString(decoded.PaymentHash) {
+		t.Fatalf("invoice payment hash = %q, want %q", invoice.PaymentHash, hex.EncodeToString(decoded.PaymentHash))
+	}
+
+	incomingOperation := func(preimageHex string) []map[string]any {
+		return []map[string]any{{
+			"id":        float64(77),
+			"direction": "INCOMING",
+			"status":    "CONFIRMED",
+			"amount":    map[string]any{"inSatoshis": amount},
+			"fee":       map[string]any{"inSatoshis": 0},
+			"incomingSwap": map[string]any{
+				"uuid":           "swap-uuid",
+				"paymentHashHex": invoice.PaymentHash,
+				"preimageHex":    preimageHex,
+			},
+		}}
+	}
+
+	// No operation yet: the invoice is ours, so this is pending rather than unknown.
+	status, err := manager.InvoiceStatus(context.Background(), invoice.PaymentHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != wallet.InvoiceStatePending || status.Settled || status.AmountSatoshis != amount {
+		t.Fatalf("pending status = %#v", status)
+	}
+
+	// Houston saw the payment but the swap is not fulfilled, so there is no preimage yet.
+	setOperations(incomingOperation(""))
+	status, err = manager.InvoiceStatus(context.Background(), invoice.PaymentHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != wallet.InvoiceStateReceiving || status.Settled || status.Preimage != "" {
+		t.Fatalf("receiving status = %#v", status)
+	}
+	if status.OperationID == nil || *status.OperationID != 77 {
+		t.Fatalf("receiving operation id = %#v", status.OperationID)
+	}
+	if status.ReceivedSatoshis == nil || *status.ReceivedSatoshis != amount {
+		t.Fatalf("receiving received amount = %#v", status.ReceivedSatoshis)
+	}
+
+	// The preimage is the proof of payment.
+	setOperations(incomingOperation(preimage))
+	status, err = manager.InvoiceStatus(context.Background(), invoice.PaymentHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != wallet.InvoiceStateSettled || !status.Settled || status.Preimage != preimage {
+		t.Fatalf("settled status = %#v", status)
+	}
+
+	// A hash this wallet never issued must not be reported as an unpaid invoice.
+	if _, err := manager.InvoiceStatus(context.Background(), strings.Repeat("ab", 32)); !errors.Is(err, wallet.ErrUnknownPaymentHash) {
+		t.Fatalf("unknown hash error = %v, want ErrUnknownPaymentHash", err)
+	}
+
+	// Malformed hashes are rejected before any lookup.
+	for _, malformed := range []string{"", "zz", strings.Repeat("ab", 31)} {
+		if _, err := manager.InvoiceStatus(context.Background(), malformed); err == nil {
+			t.Fatalf("malformed hash %q was accepted", malformed)
+		}
+	}
+}
+
+// TestOperationsSurfaceIncomingSwapPaymentHashAndPreimage checks the fields that let a caller
+// correlate an operation with the invoice that produced it.
+func TestOperationsSurfaceIncomingSwapPaymentHashAndPreimage(t *testing.T) {
+	t.Parallel()
+
+	muunKey := mustBaseKey(t, bytes.Repeat([]byte{13}, 32))
+	paymentHash := strings.Repeat("ef", 32)
+	preimage := strings.Repeat("12", 32)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/houston/sessions-v2/first":
+			w.Header().Set("Authorization", "Bearer session-token")
+			writeJSON(t, w, map[string]any{
+				"cosigningPublicKey":  map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+				"swapServerPublicKey": map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+			})
+		case "/houston/user/external-addresses-record":
+			switch r.Method {
+			case http.MethodGet:
+				writeJSON(t, w, map[string]int{"maxUsedIndex": -1, "maxWatchingIndex": 100})
+			default:
+				writeJSON(t, w, map[string]int{"maxUsedIndex": 0, "maxWatchingIndex": 100})
+			}
+		case "/houston/operations":
+			writeJSON(t, w, []map[string]any{{
+				"id":        float64(91),
+				"direction": "INCOMING",
+				"status":    "CONFIRMED",
+				"amount":    map[string]any{"inSatoshis": 4_000},
+				"fee":       map[string]any{"inSatoshis": 0},
+				"incomingSwap": map[string]any{
+					"uuid":           "swap-uuid",
+					"paymentHashHex": paymentHash,
+					"preimageHex":    preimage,
+				},
+			}})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, err := wallet.NewManager(wallet.Config{
+		DataDir:           t.TempDir(),
+		Passphrase:        "test passphrase",
+		HoustonURL:        server.URL + "/houston/",
+		PrimaryCurrency:   "USD",
+		ClientVersion:     1511,
+		ClientVersionName: "55.11",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	operations, err := manager.Operations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 1 {
+		t.Fatalf("operations = %d, want 1", len(operations))
+	}
+	if operations[0].PaymentHash != paymentHash || operations[0].Preimage != preimage {
+		t.Fatalf("operation = %#v", operations[0])
+	}
 }
