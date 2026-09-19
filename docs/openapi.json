@@ -122,6 +122,35 @@
         }
       }
     },
+    "/invoices/{paymentHash}": {
+      "get": {
+        "operationId": "getInvoiceStatus",
+        "summary": "Consulta si una invoice emitida ya fue pagada",
+        "description": "Responde sólo por invoices que emitió esta wallet: un payment hash desconocido devuelve 404 en vez de un \"no pagado\" indefinido. La liquidación sale del preimage que publica Houston, que es la única prueba del pago. Es idempotente y no dispara sincronización.",
+        "parameters": [
+          {
+            "name": "paymentHash",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+            "description": "Payment hash de la invoice, 32 bytes en hexadecimal"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Estado de la invoice",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/InvoiceStatus" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/send": {
       "post": {
         "operationId": "sendPayment",
@@ -265,9 +294,10 @@
       },
       "Invoice": {
         "type": "object",
-        "required": ["invoice"],
+        "required": ["invoice", "paymentHash"],
         "properties": {
           "invoice": { "type": "string", "description": "Invoice BOLT11" },
+          "paymentHash": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Clave para consultar el pago en GET /invoices/{paymentHash}" },
           "amountSatoshis": { "type": "integer", "format": "int64", "minimum": 1 }
         }
       },
@@ -336,7 +366,26 @@
           "feeSatoshis": { "type": "integer", "format": "int64" },
           "confirmations": { "type": "integer", "format": "int64", "minimum": 0 },
           "transactionId": { "type": "string" },
-          "receiverAddress": { "type": "string" }
+          "receiverAddress": { "type": "string" },
+          "paymentHash": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Sólo en incoming swaps Lightning. Correlaciona la operación con su invoice." },
+          "preimage": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Sólo en incoming swaps Lightning liquidados. Su presencia prueba el pago." }
+        }
+      },
+      "InvoiceStatus": {
+        "type": "object",
+        "required": ["paymentHash", "state", "settled", "amountSatoshis"],
+        "properties": {
+          "paymentHash": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+          "state": {
+            "type": "string",
+            "enum": ["pending", "receiving", "settled"],
+            "description": "pending: la invoice es de esta wallet y Houston no reporta pago. receiving: el pago llegó pero su incoming swap no está liquidado, así que no hay preimage y los fondos no son gastables; el poller lo liquida cada MUUN_WRAPPER_SYNC_INTERVAL, o se fuerza con POST /sync. settled: el preimage prueba el pago."
+          },
+          "settled": { "type": "boolean", "description": "true sólo en el estado settled" },
+          "preimage": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "Presente sólo cuando settled es true" },
+          "amountSatoshis": { "type": "integer", "format": "int64", "description": "Monto que pidió la invoice" },
+          "receivedSatoshis": { "type": "integer", "format": "int64", "description": "Monto que reporta Houston. Comparalo con amountSatoshis." },
+          "operationId": { "type": "integer", "format": "int64" }
         }
       },
       "Error": {

@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/jinzhu/gorm"
 	libwallet "github.com/muun/libwallet"
 	"github.com/muun/libwallet/walletdb"
 )
@@ -58,7 +59,38 @@ type Balance struct {
 // Invoice is a BOLT11 payment request created for an incoming Lightning payment.
 type Invoice struct {
 	Invoice        string `json:"invoice"`
+	PaymentHash    string `json:"paymentHash"`
 	AmountSatoshis *int64 `json:"amountSatoshis,omitempty"`
+}
+
+// Invoice settlement states reported by InvoiceStatus.
+const (
+	// InvoiceStatePending means this wallet issued the invoice and Houston reports no payment yet.
+	InvoiceStatePending = "pending"
+	// InvoiceStateReceiving means the payment reached Houston but its incoming swap is not
+	// fulfilled yet, so the preimage does not exist and the funds are not spendable. Sync, or the
+	// poller, fulfills it.
+	InvoiceStateReceiving = "receiving"
+	// InvoiceStateSettled means the incoming swap is fulfilled and the preimage proves the payment.
+	InvoiceStateSettled = "settled"
+)
+
+// ErrUnknownPaymentHash reports a payment hash this wallet never issued an invoice for.
+var ErrUnknownPaymentHash = errors.New("unknown payment hash")
+
+// InvoiceStatus reports whether the Lightning payment for one issued invoice settled.
+//
+// Settlement is derived from the preimage Houston publishes on the incoming swap, which is the
+// only proof the payment completed. AmountSatoshis is what the invoice asked for and
+// ReceivedSatoshis is what Houston reports, so a caller can assert the two agree.
+type InvoiceStatus struct {
+	PaymentHash      string `json:"paymentHash"`
+	State            string `json:"state"`
+	Settled          bool   `json:"settled"`
+	Preimage         string `json:"preimage,omitempty"`
+	AmountSatoshis   int64  `json:"amountSatoshis"`
+	ReceivedSatoshis *int64 `json:"receivedSatoshis,omitempty"`
+	OperationID      *int64 `json:"operationId,omitempty"`
 }
 
 // SyncResult reports incoming Lightning swaps that were fulfilled during one synchronization.
@@ -76,6 +108,10 @@ type Operation struct {
 	Confirmations   int64  `json:"confirmations"`
 	TransactionID   string `json:"transactionId,omitempty"`
 	ReceiverAddress string `json:"receiverAddress,omitempty"`
+	// PaymentHash and Preimage are only present on incoming Lightning swaps. A non-empty Preimage
+	// proves the payment settled.
+	PaymentHash string `json:"paymentHash,omitempty"`
+	Preimage    string `json:"preimage,omitempty"`
 }
 
 // Manager owns one encrypted Muun wallet in Config.DataDir.
@@ -655,12 +691,104 @@ func (m *Manager) ReceiveInvoice(ctx context.Context, amountSatoshis *int64) (In
 		return Invoice{}, errors.New("no registered invoice secrets are available")
 	}
 
-	result := Invoice{Invoice: encoded}
+	// The payment hash is the key callers use to check settlement later. Read it back from the
+	// invoice that was just built instead of guessing which pooled secret the builder consumed.
+	decoded, err := libwallet.ParseInvoice(encoded, libwallet.Mainnet())
+	if err != nil {
+		return Invoice{}, fmt.Errorf("decode the invoice that was just built: %w", err)
+	}
+
+	result := Invoice{Invoice: encoded, PaymentHash: hex.EncodeToString(decoded.PaymentHash)}
 	if amountSatoshis != nil {
 		amount := *amountSatoshis
 		result.AmountSatoshis = &amount
 	}
 	return result, nil
+}
+
+// InvoiceStatus reports whether the invoice for paymentHashHex was paid.
+//
+// It answers only for invoices this wallet issued: the local invoice database is the ownership
+// check, so an unknown hash returns ErrUnknownPaymentHash instead of an indefinite "not paid".
+// Settlement itself comes from Houston, because the preimage is the only proof of payment.
+func (m *Manager) InvoiceStatus(ctx context.Context, paymentHashHex string) (InvoiceStatus, error) {
+	normalized := strings.ToLower(strings.TrimSpace(paymentHashHex))
+	paymentHash, err := hex.DecodeString(normalized)
+	if err != nil || len(paymentHash) != 32 {
+		return InvoiceStatus{}, errors.New("payment hash must be 32 bytes in hexadecimal")
+	}
+
+	record, err := m.loadRecord()
+	if err != nil {
+		return InvoiceStatus{}, err
+	}
+
+	local, err := m.findLocalInvoice(paymentHash)
+	if err != nil {
+		return InvoiceStatus{}, err
+	}
+
+	var remote []operationJSON
+	if _, err := m.doJSON(ctx, http.MethodGet, "operations", record.SessionToken, nil, &remote); err != nil {
+		return InvoiceStatus{}, fmt.Errorf("fetch operations for invoice status: %w", err)
+	}
+
+	status := InvoiceStatus{
+		PaymentHash:    normalized,
+		State:          InvoiceStatePending,
+		AmountSatoshis: local.AmountSat,
+	}
+	for _, operation := range remote {
+		if operation.IncomingSwap == nil ||
+			!strings.EqualFold(operation.IncomingSwap.PaymentHashHex, normalized) {
+			continue
+		}
+		status.State = InvoiceStateReceiving
+		if operation.ID != nil {
+			id := *operation.ID
+			status.OperationID = &id
+		}
+		if operation.Amount != nil && operation.Amount.InSatoshis != nil {
+			received := *operation.Amount.InSatoshis
+			status.ReceivedSatoshis = &received
+		}
+		if operation.IncomingSwap.PreimageHex != "" {
+			status.State = InvoiceStateSettled
+			status.Settled = true
+			status.Preimage = operation.IncomingSwap.PreimageHex
+		}
+		break
+	}
+	return status, nil
+}
+
+// findLocalInvoice reads one invoice secret from the wallet database. It takes invoicePoolMu
+// because ensureInvoicePool repoints libwallet's process-global pool, so an unsynchronized read
+// can race an in-flight ReceiveInvoice or Sync. The Houston request stays outside this lock.
+func (m *Manager) findLocalInvoice(paymentHash []byte) (*walletdb.Invoice, error) {
+	invoicePoolMu.Lock()
+	defer invoicePoolMu.Unlock()
+
+	if err := m.ensureInvoicePool(); err != nil {
+		return nil, err
+	}
+
+	var found *walletdb.Invoice
+	err := m.invoicePool.WithDB(func(db *walletdb.DB) error {
+		invoice, err := db.FindByPaymentHash(paymentHash)
+		if err != nil {
+			return err
+		}
+		found = invoice
+		return nil
+	})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrUnknownPaymentHash
+	}
+	if err != nil {
+		return nil, fmt.Errorf("look up invoice secret: %w", err)
+	}
+	return found, nil
 }
 
 func (m *Manager) ensureInvoicePool() error {
@@ -756,6 +884,10 @@ func mapOperation(remote operationJSON) (Operation, error) {
 		if remote.Transaction.Confirmations != nil {
 			operation.Confirmations = *remote.Transaction.Confirmations
 		}
+	}
+	if remote.IncomingSwap != nil {
+		operation.PaymentHash = remote.IncomingSwap.PaymentHashHex
+		operation.Preimage = remote.IncomingSwap.PreimageHex
 	}
 	return operation, nil
 }

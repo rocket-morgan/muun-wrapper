@@ -97,6 +97,33 @@ func (c *Client) Operations(ctx context.Context) ([]wallet.Operation, error) {
 	return operations, nil
 }
 
+// InvoiceStatus reports whether the invoice for paymentHash was paid.
+func (c *Client) InvoiceStatus(ctx context.Context, paymentHash string) (wallet.InvoiceStatus, error) {
+	endpoint := c.baseURL.ResolveReference(&url.URL{Path: "invoices/" + url.PathEscape(paymentHash)})
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return wallet.InvoiceStatus{}, fmt.Errorf("build API request: %w", err)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Authorization", "Bearer "+c.token)
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return wallet.InvoiceStatus{}, fmt.Errorf("call wrapper API: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		return wallet.InvoiceStatus{}, fmt.Errorf("wrapper API returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+
+	var status wallet.InvoiceStatus
+	if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
+		return wallet.InvoiceStatus{}, fmt.Errorf("decode API response: %w", err)
+	}
+	return status, nil
+}
+
 // ReceiveInvoice creates a BOLT11 payment request for an incoming Lightning payment.
 func (c *Client) ReceiveInvoice(ctx context.Context, amountSatoshis *int64) (wallet.Invoice, error) {
 	payload, err := json.Marshal(struct {

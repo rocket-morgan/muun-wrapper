@@ -281,6 +281,10 @@ type fakeWallet struct {
 	invoiceAmount       *int64
 	sendRequest         wallet.SendRequest
 	recoveryCode        string
+	invoiceStatusCalls  int
+	invoiceStatusResult wallet.InvoiceStatus
+	invoiceStatusErr    error
+	invoiceStatusHash   string
 }
 
 func (w *fakeWallet) Create(context.Context) (wallet.WalletInfo, error) {
@@ -309,6 +313,12 @@ func (w *fakeWallet) ReceiveInvoice(_ context.Context, amount *int64) (wallet.In
 	return w.invoiceResult, w.invoiceErr
 }
 
+func (w *fakeWallet) InvoiceStatus(_ context.Context, paymentHash string) (wallet.InvoiceStatus, error) {
+	w.invoiceStatusCalls++
+	w.invoiceStatusHash = paymentHash
+	return w.invoiceStatusResult, w.invoiceStatusErr
+}
+
 func (w *fakeWallet) Sync(context.Context) (wallet.SyncResult, error) {
 	w.syncCalls++
 	return w.syncResult, w.syncErr
@@ -329,4 +339,104 @@ func (w *fakeWallet) SetupRecovery(_ context.Context, recoveryCode string) (wall
 func (w *fakeWallet) EmergencyKit(context.Context) (wallet.EmergencyKit, error) {
 	w.emergencyKitCalls++
 	return w.emergencyKitResult, w.emergencyKitErr
+}
+
+func TestInvoiceStatusReturnsSettlementForIssuedInvoice(t *testing.T) {
+	t.Parallel()
+	hash := strings.Repeat("ab", 32)
+	operationID := int64(42)
+	received := int64(1000)
+	service := &fakeWallet{invoiceStatusResult: wallet.InvoiceStatus{
+		PaymentHash:      hash,
+		State:            wallet.InvoiceStateSettled,
+		Settled:          true,
+		Preimage:         strings.Repeat("cd", 32),
+		AmountSatoshis:   1000,
+		ReceivedSatoshis: &received,
+		OperationID:      &operationID,
+	}}
+	server := NewServer(service, "api-token")
+
+	request := httptest.NewRequest(http.MethodGet, "/invoices/"+hash, nil)
+	request.Header.Set("Authorization", "Bearer api-token")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if service.invoiceStatusHash != hash {
+		t.Fatalf("payment hash = %q, want %q", service.invoiceStatusHash, hash)
+	}
+	var body wallet.InvoiceStatus
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(body, service.invoiceStatusResult) {
+		t.Fatalf("body = %#v, want %#v", body, service.invoiceStatusResult)
+	}
+}
+
+func TestInvoiceStatusRequiresStaticToken(t *testing.T) {
+	t.Parallel()
+	service := &fakeWallet{}
+	server := NewServer(service, "api-token")
+
+	request := httptest.NewRequest(http.MethodGet, "/invoices/"+strings.Repeat("ab", 32), nil)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+	if service.invoiceStatusCalls != 0 {
+		t.Fatalf("invoice status calls = %d, want 0", service.invoiceStatusCalls)
+	}
+}
+
+func TestInvoiceStatusReportsUnknownHashAsNotFound(t *testing.T) {
+	t.Parallel()
+	service := &fakeWallet{invoiceStatusErr: wallet.ErrUnknownPaymentHash}
+	server := NewServer(service, "api-token")
+
+	request := httptest.NewRequest(http.MethodGet, "/invoices/"+strings.Repeat("ab", 32), nil)
+	request.Header.Set("Authorization", "Bearer api-token")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+}
+
+func TestInvoiceStatusRejectsMalformedPaths(t *testing.T) {
+	t.Parallel()
+	for _, testCase := range []struct {
+		name   string
+		method string
+		path   string
+		status int
+	}{
+		{name: "empty hash", method: http.MethodGet, path: "/invoices/", status: http.StatusBadRequest},
+		{name: "extra segment", method: http.MethodGet, path: "/invoices/abcd/extra", status: http.StatusBadRequest},
+		{name: "wrong method", method: http.MethodPost, path: "/invoices/abcd", status: http.StatusMethodNotAllowed},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			service := &fakeWallet{}
+			server := NewServer(service, "api-token")
+
+			request := httptest.NewRequest(testCase.method, testCase.path, nil)
+			request.Header.Set("Authorization", "Bearer api-token")
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+
+			if response.Code != testCase.status {
+				t.Fatalf("status = %d, want %d", response.Code, testCase.status)
+			}
+			if service.invoiceStatusCalls != 0 {
+				t.Fatalf("invoice status calls = %d, want 0", service.invoiceStatusCalls)
+			}
+		})
+	}
 }
