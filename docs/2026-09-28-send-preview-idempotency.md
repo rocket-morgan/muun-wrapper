@@ -32,6 +32,15 @@ Cada registro contiene la key, `sha256(destination|amountSatoshis)`, el estado, 
 un `request_id` UUIDv5 de namespace fijo y timestamps. El `request_id` se usa como `requestId` de
 la operación saliente de Houston, de modo que un retry tras reiniciar conserva la misma identidad.
 
+### Semántica de `SendResult`
+
+En el `201` de `POST /send`, en `POST /send/reconcile/{key}` y en el resultado persistido que
+devuelve `GET /send/status/{key}`, `amountSatoshis` siempre es el monto pedido al destinatario,
+sin fee, tanto onchain como Lightning. `feeSatoshis` es la comisión separada. Para reconciliar,
+el wrapper usa `OperationJson.amount` y `OperationJson.fee` de Houston: al crear la operación
+saliente envía el monto pedido y la fee como campos distintos. No usa `outputAmountInSatoshis`,
+porque en un submarine swap es el output de funding y puede diferir del monto de la invoice.
+
 | Estado | Comportamiento de un nuevo `POST /send` con la misma key |
 | --- | --- |
 | `in_flight` | `409 send_in_progress`; no se vuelve a llamar a Houston. |

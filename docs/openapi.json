@@ -717,12 +717,14 @@
           },
           "amountSatoshis": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Monto solicitado al destinatario, sin comisión, tanto para onchain como Lightning. POST /send/reconcile y GET /send/status repiten esta misma semántica."
           },
           "feeSatoshis": {
             "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "minimum": 0,
+            "description": "Comisión del envío, separada de amountSatoshis."
           },
           "paymentHash": {
             "type": "string",

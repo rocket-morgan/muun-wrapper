@@ -392,6 +392,7 @@ func (m *Manager) ReconcileSend(ctx context.Context, key string) (SendStatus, er
 			TransactionID:  stringValue(mapped.TransactionID),
 			AmountSatoshis: mapped.AmountSatoshis,
 			FeeSatoshis:    mapped.FeeSatoshis,
+			PaymentHash:    outgoingSwapPaymentHash(operation),
 		}
 		if err := m.sendIdempotency.done(key, result); err != nil {
 			return SendStatus{}, fmt.Errorf("persist reconciled send: %w", err)
@@ -405,6 +406,13 @@ func (m *Manager) ReconcileSend(ctx context.Context, key string) (SendStatus, er
 		return SendStatus{}, fmt.Errorf("mark missing Houston operation retryable: %w", err)
 	}
 	return SendStatus{State: SendFailedPreSubmit}, nil
+}
+
+func outgoingSwapPaymentHash(operation operationJSON) string {
+	if operation.Swap == nil {
+		return ""
+	}
+	return strings.TrimSpace(operation.Swap.FundingOutputData.ServerPaymentHashInHex)
 }
 
 // ErrUnknownOperation reports an operation id absent from Houston's current history.

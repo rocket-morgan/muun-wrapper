@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -158,6 +159,68 @@ func TestReconcileSendClosesInflightKeyWhenHoustonReturnsMatchingRequestID(t *te
 	}
 	if persisted.State != SendDone || persisted.Result == nil || persisted.Result.OperationID != 99 {
 		t.Fatalf("persisted status = %#v", persisted)
+	}
+}
+
+func TestReconcileSendPersistsLightningPaymentHashAndRequestedAmount(t *testing.T) {
+	t.Parallel()
+
+	const requestedAmount = int64(1_000)
+	const fee = int64(73)
+	paymentHash := strings.Repeat("ab", 32)
+	var requestID string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.URL.Path != "/houston/operations" {
+			t.Fatalf("request = %s %s", request.Method, request.URL.Path)
+		}
+		writeTestJSON(t, writer, []map[string]any{{
+			"id":                     100,
+			"requestId":              requestID,
+			"direction":              "OUTGOING",
+			"status":                 "SWAP_PENDING",
+			"creationDate":           "2026-09-28T00:00:00Z",
+			"amount":                 map[string]any{"inSatoshis": requestedAmount},
+			"fee":                    map[string]any{"inSatoshis": fee},
+			"outputAmountInSatoshis": requestedAmount + fee,
+			"swap": map[string]any{
+				"swapUuid": "reconciled-lightning-swap",
+				"fundingOutput": map[string]any{
+					"serverPaymentHashInHex": paymentHash,
+				},
+			},
+		}})
+	}))
+	defer server.Close()
+
+	config := Config{DataDir: t.TempDir(), Passphrase: "test passphrase", HoustonURL: server.URL + "/houston/"}
+	manager, err := NewManager(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.saveRecord(walletRecord{Version: 1, EncryptedBasePrivateKey: "not-used-by-reconcile", SessionToken: "session-token"}); err != nil {
+		t.Fatal(err)
+	}
+	record, _, err := manager.sendIdempotency.start("stuck-lightning-transfer", sendRequestHash(SendRequest{Destination: "lnbc1example", AmountSatoshis: requestedAmount}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID = record.RequestID
+	manager.sendIdempotency.deactivate("stuck-lightning-transfer")
+
+	status, err := manager.ReconcileSend(context.Background(), "stuck-lightning-transfer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := SendResult{OperationID: 100, AmountSatoshis: requestedAmount, FeeSatoshis: fee, PaymentHash: paymentHash}
+	if status.State != SendDone || status.Result == nil || *status.Result != want {
+		t.Fatalf("status = %#v, want done result %#v", status, want)
+	}
+	persisted, err := manager.SendStatus(context.Background(), "stuck-lightning-transfer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != SendDone || persisted.Result == nil || *persisted.Result != want {
+		t.Fatalf("persisted = %#v, want done result %#v", persisted, want)
 	}
 }
 
