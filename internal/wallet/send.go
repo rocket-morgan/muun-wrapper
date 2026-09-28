@@ -311,8 +311,7 @@ func (m *Manager) SendWithOutcome(ctx context.Context, request SendRequest) (Sen
 	}
 	if keyed {
 		if err := m.sendIdempotency.done(request.IdempotencyKey, result); err != nil {
-			// The outgoing operation can already exist. Preserve in_flight so a client cannot
-			// accidentally submit a duplicate while the operator reconciles it.
+			// The operation may already exist in Houston; keep in_flight to block a duplicate.
 			return SendOutcome{}, &SendError{Cause: fmt.Errorf("persist submitted send result: %w", err), Submitted: true}
 		}
 	}
@@ -466,8 +465,7 @@ type SendPreview struct {
 }
 
 func syntheticPreviewTaprootOutput() (string, error) {
-	// Any valid x-only key produces a valid P2TR output. It is never signed, broadcast, or reused
-	// as a receive address; it only makes the destination-independent quote explicit.
+	// Placeholder P2TR output for a destination-independent quote; never signed or broadcast.
 	address, err := btcutilw.NewAddressTaprootKey(bytes.Repeat([]byte{1}, 32), &chaincfg.MainNetParams)
 	if err != nil {
 		return "", fmt.Errorf("create synthetic Taproot preview output: %w", err)
