@@ -272,7 +272,7 @@ func (s *Server) sendStatus(writer http.ResponseWriter, request *http.Request) {
 	}
 	status, err := s.wallet.SendStatus(request.Context(), key)
 	if errors.Is(err, wallet.ErrUnknownIdempotencyKey) {
-		writeError(writer, http.StatusNotFound, err.Error())
+		writeCodedError(writer, http.StatusNotFound, err.Error(), "idempotency_key_not_found")
 		return
 	}
 	if err != nil {

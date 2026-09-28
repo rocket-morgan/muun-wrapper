@@ -53,6 +53,7 @@ swap sigue siendo pre-submit; un error al crear la operación, firmar o subir
 | Houston responde 401/403 antes de `POST /operations` | 503 | `houston_session` | `failed_pre_submit` |
 | La key ya está ejecutándose | 409 | `send_in_progress` | `in_flight` |
 | La key cambia destino o monto | 422 | `idempotency_key_reused` | sin cambios |
+| `GET /send/status/{key}` no encuentra la key | 404 | `idempotency_key_not_found` | no existe |
 | `POST /operations`, firma o `PUT raw-transactions` falla | 502 | `submit_failed` | `in_flight` |
 
 `doJSON` conserva el status HTTP de Houston. En esta fase la detección de sesión vencida usa los
@@ -60,7 +61,9 @@ HTTP 401 y 403; no se observó un `errorCode` de sesión adicional en las prueba
 
 ## Reconciliación
 
-`GET /send/status/{key}` lee sólo el registro local. `POST /send/reconcile/{key}` busca el
+`GET /send/status/{key}` lee sólo el registro local. Una key desconocida responde exactamente
+`404 {"error":"unknown idempotency key","code":"idempotency_key_not_found"}`; el backend usa ese
+código como capability check antes de enviar un retiro. `POST /send/reconcile/{key}` busca el
 `requestId` persistido en `GET /operations` de Houston. Si encuentra una operación, guarda un
 `SendResult` y cierra la key en `done`; si Houston devuelve al menos un `requestId` pero no el de
 la key, pasa a `failed_pre_submit` para permitir un retry. Si el historial no expone ningún
@@ -68,9 +71,21 @@ la key, pasa a `failed_pre_submit` para permitir un retry. Si el historial no ex
 ausencia de la operación sin arriesgar un pago duplicado. Mientras un send sigue activo en este
 proceso, reconcile responde `409 send_in_progress` y tampoco cambia la key.
 
-## Estados normalizados de operación
+## Operaciones normalizadas
 
-`GET /operations/{id}` conserva el shape de una operación e incluye `paymentState`:
+`GET /operations` y `GET /operations/{id}` devuelven el mismo shape. Ambos mantienen `status`
+crudo de Houston y agregan `paymentState`, `createdAt` RFC3339 UTC, `transactionId` nullable y
+`confirmations`.
+
+| Campo | Fuente | Regla |
+| --- | --- | --- |
+| `createdAt` | `OperationJson.creationDate` de Houston | Se valida y normaliza a RFC3339 UTC (con precisión fraccional si Houston la envía). No hay fallback local. |
+| `transactionId` | `OperationJson.transaction.hash` de Houston | Txid onchain incoming y outgoing; `null` para Lightning, aun si el swap tiene una transacción de funding. |
+| `receiverAddress` | `OperationJson.receiverAddress` de Houston | Se expone tanto para incoming onchain como outgoing cuando Houston lo informa. Un incoming sin esa propiedad queda sin dirección: la alternativa sería derivarla de una transacción onchain/libwallet, que no se hace en esta fase. |
+| `confirmations` | `OperationJson.confirmations` de Houston | Confirmaciones reales onchain; se usa la anidada `transaction.confirmations` sólo como compatibilidad con respuestas antiguas. Lightning devuelve `0`. |
+| `paymentState` | `OperationJson.status` de Houston | Mapeado por el wrapper, manteniendo `status` original. |
+
+Los estados normalizados son:
 
 | `paymentState` | Estados de Houston/Apollo |
 | --- | --- |

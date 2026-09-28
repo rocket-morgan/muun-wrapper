@@ -111,11 +111,12 @@ func TestReconcileSendClosesInflightKeyWhenHoustonReturnsMatchingRequestID(t *te
 			t.Fatalf("request = %s %s", request.Method, request.URL.Path)
 		}
 		writeTestJSON(t, writer, []map[string]any{{
-			"id":        99,
-			"requestId": requestID,
-			"status":    "CONFIRMED",
-			"amount":    map[string]any{"inSatoshis": 1000},
-			"fee":       map[string]any{"inSatoshis": 10},
+			"id":           99,
+			"requestId":    requestID,
+			"status":       "CONFIRMED",
+			"creationDate": "2026-09-28T00:00:00Z",
+			"amount":       map[string]any{"inSatoshis": 1000},
+			"fee":          map[string]any{"inSatoshis": 10},
 			"transaction": map[string]any{
 				"hash":          "reconciled-txid",
 				"confirmations": 1,

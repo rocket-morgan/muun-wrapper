@@ -79,8 +79,9 @@ curl http://127.0.0.1:18080/send/status/withdrawal-2026-09-28-1 \
 dirección onchain y reserva su índice en Houston. `GET /receive/address` reserva una dirección
 nueva. `GET /balance` devuelve el saldo gastable unificado en satoshis calculado por Houston:
 el último UTXO de su progresión menos la deuda esperada. `GET /healthz` no requiere autenticación.
-`GET /operations` devuelve el historial actual con dirección, estado, monto, fee, hash y
-confirmaciones cuando existen. `POST /receive/invoice` recibe `amountSatoshis`, registra los
+`GET /operations` y `GET /operations/{id}` devuelven el historial y detalle con `status` crudo,
+`paymentState`, `createdAt` RFC3339 UTC, monto, fee, `transactionId` nullable, dirección y
+confirmaciones onchain. `POST /receive/invoice` recibe `amountSatoshis`, registra los
 secretos necesarios con Houston y devuelve una invoice Lightning BOLT11 por ese monto.
 `POST /receive/invoice` devuelve además el `paymentHash` de la invoice.
 `GET /invoices/{paymentHash}` informa si esa invoice ya fue pagada. Responde sólo por invoices que
@@ -101,8 +102,9 @@ de comisión depende de los UTXOs y del monto. Para retiros automatizados enviá
 `POST /send`: se persiste en `/data/send-idempotency.json`, una respuesta completada se repite con
 `200` e `Idempotent-Replay: true`, y una key `in_flight` debe consultarse con
 `GET /send/status/{key}` o reconciliarse con `POST /send/reconcile/{key}` antes de decidir un
-reintento. No se reintenta automáticamente un error `502 submit_failed`, porque Houston puede
-haber aceptado la operación.
+reintento. Una key inexistente devuelve `404` con `code: idempotency_key_not_found`, que el
+backend usa como capability check antes de enviar retiros. No se reintenta automáticamente un
+error `502 submit_failed`, porque Houston puede haber aceptado la operación.
 
 ## Emergency Kit
 

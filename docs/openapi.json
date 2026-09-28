@@ -100,7 +100,7 @@
     "/operations": {
       "get": {
         "operationId": "listOperations",
-        "summary": "Lista las operaciones de la wallet",
+        "summary": "Lista las operaciones con estado normalizado y metadatos onchain",
         "responses": {
           "200": {
             "description": "Historial de operaciones",
@@ -121,7 +121,8 @@
           "401": {
             "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "description": "Cada fila conserva status de Houston y agrega paymentState, createdAt RFC3339, transactionId nullable y confirmations onchain."
       }
     },
     "/receive/invoice": {
@@ -384,7 +385,7 @@
     "/operations/{id}": {
       "get": {
         "operationId": "getOperation",
-        "summary": "Obtiene una operación con estado de pago normalizado",
+        "summary": "Obtiene una operación con el mismo shape normalizado del listado",
         "parameters": [
           {
             "name": "id",
@@ -399,7 +400,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Operación",
+            "description": "Operación con status crudo, paymentState, createdAt, transactionId nullable y confirmations.",
             "content": {
               "application/json": {
                 "schema": {
@@ -489,7 +490,18 @@
             "$ref": "#/components/responses/Error"
           },
           "404": {
-            "$ref": "#/components/responses/Error"
+            "description": "No existe un registro para la key; los consumidores usan code=idempotency_key_not_found como capability check.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodedError"
+                },
+                "example": {
+                  "error": "unknown idempotency key",
+                  "code": "idempotency_key_not_found"
+                }
+              }
+            }
           }
         }
       }
@@ -811,9 +823,12 @@
         "required": [
           "id",
           "status",
+          "paymentState",
+          "createdAt",
           "amountSatoshis",
           "feeSatoshis",
-          "confirmations"
+          "confirmations",
+          "transactionId"
         ],
         "properties": {
           "id": {
@@ -824,7 +839,23 @@
             "type": "string"
           },
           "status": {
-            "type": "string"
+            "type": "string",
+            "description": "Estado crudo informado por Houston."
+          },
+          "paymentState": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "paid",
+              "failed",
+              "expired"
+            ],
+            "description": "Estado normalizado a partir de status."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "creationDate de Houston, normalizada a RFC3339 UTC."
           },
           "amountSatoshis": {
             "type": "integer",
@@ -837,13 +868,17 @@
           "confirmations": {
             "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "minimum": 0,
+            "description": "Confirmaciones onchain de Houston; 0 para Lightning."
           },
           "transactionId": {
-            "type": "string"
+            "type": "string",
+            "description": "Txid onchain de Houston; null para Lightning o cuando Houston todavía no informa una transacción.",
+            "nullable": true
           },
           "receiverAddress": {
-            "type": "string"
+            "type": "string",
+            "description": "Dirección receptora informada por Houston para la operación onchain cuando está disponible."
           },
           "paymentHash": {
             "type": "string",
@@ -998,28 +1033,7 @@
         }
       },
       "OperationDetail": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/Operation"
-          },
-          {
-            "type": "object",
-            "required": [
-              "paymentState"
-            ],
-            "properties": {
-              "paymentState": {
-                "type": "string",
-                "enum": [
-                  "pending",
-                  "paid",
-                  "failed",
-                  "expired"
-                ]
-              }
-            }
-          }
-        ]
+        "$ref": "#/components/schemas/Operation"
       },
       "CodedError": {
         "type": "object",
@@ -1038,7 +1052,8 @@
               "send_in_progress",
               "idempotency_key_reused",
               "submit_failed",
-              "houston_session"
+              "houston_session",
+              "idempotency_key_not_found"
             ]
           }
         }

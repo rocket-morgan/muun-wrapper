@@ -74,6 +74,28 @@ func TestSendStatusAndOperationLookupAreAuthenticatedRoutes(t *testing.T) {
 	}
 }
 
+func TestSendStatusUnknownKeyReturnsCapabilityCheckCode(t *testing.T) {
+	t.Parallel()
+	service := &fakeWallet{sendStatusErr: wallet.ErrUnknownIdempotencyKey}
+	server := NewServer(service, "api-token")
+	request := httptest.NewRequest(http.MethodGet, "/send/status/missing-key", nil)
+	request.Header.Set("Authorization", "Bearer api-token")
+	response := httptest.NewRecorder()
+
+	server.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["error"] != "unknown idempotency key" || body["code"] != "idempotency_key_not_found" {
+		t.Fatalf("body = %#v", body)
+	}
+}
+
 func TestReconcileSendAcceptsAnEscapedKey(t *testing.T) {
 	t.Parallel()
 	service := &fakeWallet{reconcileSendResult: wallet.SendStatus{State: wallet.SendFailedPreSubmit}}
@@ -130,7 +152,7 @@ func TestSendUsesContractErrorCodesByFailurePhase(t *testing.T) {
 
 func TestOperationLookupReturnsNormalizedDetail(t *testing.T) {
 	t.Parallel()
-	want := wallet.OperationDetail{Operation: wallet.Operation{ID: 42, Status: "CONFIRMED", AmountSatoshis: 1_000, FeeSatoshis: 10, Confirmations: 2}, PaymentState: "paid"}
+	want := wallet.OperationDetail{ID: 42, Status: "CONFIRMED", PaymentState: "paid", CreatedAt: "2026-09-28T00:00:00Z", AmountSatoshis: 1_000, FeeSatoshis: 10, Confirmations: 2}
 	service := &fakeWallet{operationResult: want}
 	server := NewServer(service, "api-token")
 	request := httptest.NewRequest(http.MethodGet, "/operations/42", nil)

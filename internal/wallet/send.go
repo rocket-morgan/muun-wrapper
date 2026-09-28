@@ -389,7 +389,7 @@ func (m *Manager) ReconcileSend(ctx context.Context, key string) (SendStatus, er
 		}
 		result := SendResult{
 			OperationID:    mapped.ID,
-			TransactionID:  mapped.TransactionID,
+			TransactionID:  stringValue(mapped.TransactionID),
 			AmountSatoshis: mapped.AmountSatoshis,
 			FeeSatoshis:    mapped.FeeSatoshis,
 		}
@@ -435,7 +435,7 @@ func (m *Manager) Operation(ctx context.Context, id int64) (OperationDetail, err
 		if err != nil {
 			return OperationDetail{}, fmt.Errorf("map operation %d: %w", id, err)
 		}
-		return OperationDetail{Operation: operation, PaymentState: mapPaymentState(candidate.Status)}, nil
+		return operation, nil
 	}
 	return OperationDetail{}, ErrUnknownOperation
 }

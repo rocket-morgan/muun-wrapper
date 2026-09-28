@@ -29,8 +29,8 @@ docker compose exec -T muun-wrapper sh -c \
 | `create` | Crea la wallet para el directorio de datos actual y devuelve la primera dirección. Sólo funciona una vez. | — |
 | `address` | Reserva y devuelve una nueva dirección onchain Taproot. | — |
 | `balance` | Devuelve el saldo gastable en satoshis. | — |
-| `operations` | Lista las operaciones informadas por Houston. | — |
-| `operation` | Consulta una operación con `paymentState` normalizado y confirmaciones. | `--operation-id N` |
+| `operations` | Lista operaciones con `status`, `paymentState`, `createdAt`, `transactionId` nullable y confirmaciones. | — |
+| `operation` | Consulta una operación con el mismo shape normalizado del listado. | `--operation-id N` |
 | `invoice` | Crea una invoice BOLT11 para recibir Lightning. Devuelve también su `paymentHash`. | `--amount-sats N` |
 | `invoice-status` | Informa si una invoice emitida ya fue pagada. | `--payment-hash HEX` |
 | `send-preview` | Cotiza un envío sin firmarlo ni publicarlo. En onchain no necesita destino. | `--amount-sats N`; `--method onchain|lightning` opcional |
@@ -62,6 +62,14 @@ mostrar además la deuda pendiente de swaps que Houston liquida al gastar UTXOs.
 `send-preview --method onchain` permite calcular la comisión sin `--destination`; el wrapper usa
 un output P2TR sintético. `send-preview --method lightning` requiere una BOLT11 con monto fijo
 igual a `--amount-sats`.
+
+`send-status` usa una key persistente. Una key inexistente responde HTTP 404 con
+`code: idempotency_key_not_found`; ese código es el capability check que el backend usa antes de
+habilitar retiros idempotentes.
+
+`operations` y `operation` mantienen el `status` crudo de Houston y devuelven también
+`paymentState`, `createdAt` RFC3339 UTC, `transactionId` (string onchain o `null` Lightning) y
+`confirmations`. `receiverAddress` aparece cuando Houston la reporta, incluidos depósitos onchain.
 
 ## Ejemplos
 
