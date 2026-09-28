@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/wapu/muun-wrapper/internal/wallet"
@@ -302,4 +303,85 @@ func (c *Client) doWalletInfo(ctx context.Context, method, path string) (wallet.
 		return wallet.WalletInfo{}, fmt.Errorf("decode API response: %w", err)
 	}
 	return info, nil
+}
+
+// PreviewSend estimates an on-chain or Lightning payment without signing or broadcasting it.
+func (c *Client) PreviewSend(ctx context.Context, input wallet.SendPreviewRequest) (wallet.SendPreview, error) {
+	var result wallet.SendPreview
+	if err := c.doJSON(ctx, http.MethodPost, "send/preview", input, &result); err != nil {
+		return wallet.SendPreview{}, err
+	}
+	return result, nil
+}
+
+// SendStatus returns the local durable state for an idempotency key.
+func (c *Client) SendStatus(ctx context.Context, key string) (wallet.SendStatus, error) {
+	var result wallet.SendStatus
+	if err := c.doJSONURL(ctx, http.MethodGet, escapedKeyURL("send/status/", key), nil, &result); err != nil {
+		return wallet.SendStatus{}, err
+	}
+	return result, nil
+}
+
+// ReconcileSend asks the wrapper to reconcile a stuck key with Houston's operation history.
+func (c *Client) ReconcileSend(ctx context.Context, key string) (wallet.SendStatus, error) {
+	var result wallet.SendStatus
+	if err := c.doJSONURL(ctx, http.MethodPost, escapedKeyURL("send/reconcile/", key), nil, &result); err != nil {
+		return wallet.SendStatus{}, err
+	}
+	return result, nil
+}
+
+// Operation returns a normalized view of one operation by its Houston id.
+func (c *Client) Operation(ctx context.Context, id int64) (wallet.OperationDetail, error) {
+	var result wallet.OperationDetail
+	if err := c.doJSON(ctx, http.MethodGet, "operations/"+strconv.FormatInt(id, 10), nil, &result); err != nil {
+		return wallet.OperationDetail{}, err
+	}
+	return result, nil
+}
+
+func (c *Client) doJSON(ctx context.Context, method, path string, input, output any) error {
+	return c.doJSONURL(ctx, method, &url.URL{Path: path}, input, output)
+}
+
+func escapedKeyURL(prefix, key string) *url.URL {
+	return &url.URL{Path: prefix + key, RawPath: prefix + url.PathEscape(key)}
+}
+
+func (c *Client) doJSONURL(ctx context.Context, method string, relative *url.URL, input, output any) error {
+	var body io.Reader
+	if input != nil {
+		payload, err := json.Marshal(input)
+		if err != nil {
+			return fmt.Errorf("encode API request: %w", err)
+		}
+		body = bytes.NewReader(payload)
+	}
+	endpoint := c.baseURL.ResolveReference(relative)
+	request, err := http.NewRequestWithContext(ctx, method, endpoint.String(), body)
+	if err != nil {
+		return fmt.Errorf("build API request: %w", err)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Authorization", "Bearer "+c.token)
+	if input != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("call wrapper API: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		return fmt.Errorf("wrapper API returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	if output != nil && response.StatusCode != http.StatusNoContent {
+		if err := json.NewDecoder(response.Body).Decode(output); err != nil {
+			return fmt.Errorf("decode API response: %w", err)
+		}
+	}
+	return nil
 }

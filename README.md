@@ -61,10 +61,18 @@ curl -X POST http://127.0.0.1:18080/send \
   -H "Content-Type: application/json" \
   --data '{"destination":"bc1qexample","amountSatoshis":10000,"description":"onchain"}'
 
+curl -X POST http://127.0.0.1:18080/send/preview \
+  -H "Authorization: Bearer $MUUN_WRAPPER_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"amountSatoshis":2500,"method":"onchain"}'
+
 curl -X POST http://127.0.0.1:18080/send \
   -H "Authorization: Bearer $MUUN_WRAPPER_API_TOKEN" \
   -H "Content-Type: application/json" \
-  --data '{"destination":"lnbc...","amountSatoshis":2500}'
+  --data '{"destination":"lnbc...","amountSatoshis":2500,"idempotencyKey":"withdrawal-2026-09-28-1"}'
+
+curl http://127.0.0.1:18080/send/status/withdrawal-2026-09-28-1 \
+  -H "Authorization: Bearer $MUUN_WRAPPER_API_TOKEN"
 ```
 
 `POST /wallet/create` sólo puede ejecutarse una vez por directorio de datos. Devuelve la primera
@@ -84,10 +92,17 @@ incluye `paymentHash` y `preimage` en los incoming swaps, para correlacionar ope
 invoices.
 `POST /sync` busca incoming swaps pendientes en la historia de Houston y los liquida; ejecutalo
 después de pagar una invoice si no querés esperar al poller. El servidor también sincroniza al
-iniciar y cada `MUUN_WRAPPER_SYNC_INTERVAL` (20 segundos por defecto). `POST /send` recibe una
-dirección Bitcoin o una invoice Lightning BOLT11 con monto fijo, más `amountSatoshis`. En onchain
-firma y publica la transacción. En Lightning crea un submarine swap v2, lo valida contra la invoice
-y publica la transacción de funding; si Houston presta el monto, no hay transacción onchain.
+iniciar y cada `MUUN_WRAPPER_SYNC_INTERVAL` (20 segundos por defecto). `POST /send` recibe una dirección Bitcoin o una invoice Lightning BOLT11 con monto fijo, más
+`amountSatoshis`. En onchain firma y publica la transacción. En Lightning crea un submarine swap
+v2, lo valida contra la invoice y publica la transacción de funding; si Houston presta el monto,
+no hay transacción onchain. `POST /send/preview` calcula la comisión sin firmar ni publicar. En
+onchain puede omitirse `destination`; el wrapper usa un output Taproot sintético porque el cálculo
+de comisión depende de los UTXOs y del monto. Para retiros automatizados enviá `idempotencyKey` en
+`POST /send`: se persiste en `/data/send-idempotency.json`, una respuesta completada se repite con
+`200` e `Idempotent-Replay: true`, y una key `in_flight` debe consultarse con
+`GET /send/status/{key}` o reconciliarse con `POST /send/reconcile/{key}` antes de decidir un
+reintento. No se reintenta automáticamente un error `502 submit_failed`, porque Houston puede
+haber aceptado la operación.
 
 ## Emergency Kit
 
@@ -143,7 +158,10 @@ docker compose exec -T muun-wrapper sh -c \
   'muun-wrapper send --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --destination bc1qexample --amount-sats 10000 --description onchain'
 
 docker compose exec -T muun-wrapper sh -c \
-  'muun-wrapper send --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --destination lnbc... --amount-sats 2500'
+  'muun-wrapper send-preview --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --amount-sats 2500 --method onchain'
+
+docker compose exec -T muun-wrapper sh -c \
+  'muun-wrapper send --api-url http://127.0.0.1:8080 --api-token "$MUUN_WRAPPER_API_TOKEN" --destination lnbc... --amount-sats 2500 --idempotency-key withdrawal-2026-09-28-1'
 ```
 
 ## Desarrollo y verificación

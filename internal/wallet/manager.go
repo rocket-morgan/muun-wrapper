@@ -114,6 +114,13 @@ type Operation struct {
 	Preimage    string `json:"preimage,omitempty"`
 }
 
+// OperationDetail augments the list-operation shape with the normalized payment lifecycle used
+// by consumers of GET /operations/{id}.
+type OperationDetail struct {
+	Operation
+	PaymentState string `json:"paymentState"`
+}
+
 // Manager owns one encrypted Muun wallet in Config.DataDir.
 type Manager struct {
 	config                  Config
@@ -121,6 +128,7 @@ type Manager struct {
 	invoicePool             *walletdb.Pool
 	receiveMu               sync.Mutex
 	sendMu                  sync.Mutex
+	sendIdempotency         *sendIdempotencyStore
 	recoveryMu              sync.Mutex
 	signOutgoingTransaction outgoingTransactionSigner
 }
@@ -250,6 +258,7 @@ type sizeForAmount struct {
 
 type operationJSON struct {
 	ID              *int64            `json:"id"`
+	RequestID       string            `json:"requestId,omitempty"`
 	Direction       string            `json:"direction"`
 	Status          string            `json:"status"`
 	ReceiverAddress string            `json:"receiverAddress"`
@@ -304,6 +313,7 @@ func NewManager(config Config) (*Manager, error) {
 	return &Manager{
 		config:                  config,
 		client:                  http.DefaultClient,
+		sendIdempotency:         newSendIdempotencyStore(config.DataDir),
 		signOutgoingTransaction: signPartiallySignedTransaction,
 	}, nil
 }
@@ -854,6 +864,23 @@ func (m *Manager) registerInvoiceSecrets(ctx context.Context, token string, secr
 	return nil
 }
 
+// mapPaymentState follows Apollo's outgoing-operation classification. Unknown future
+// Houston statuses remain pending rather than being misreported as paid or failed.
+func mapPaymentState(status string) string {
+	switch strings.ToUpper(status) {
+	case "CONFIRMED", "SETTLED", "SWAP_PAYED":
+		return "paid"
+	case "DROPPED", "FAILED", "SWAP_FAILED":
+		return "failed"
+	case "SWAP_EXPIRED":
+		return "expired"
+	case "CREATED", "SIGNING", "SIGNED", "BROADCASTED", "SWAP_PENDING", "SWAP_ROUTING", "SWAP_OPENING_CHANNEL", "SWAP_WAITING_CHANNEL":
+		return "pending"
+	default:
+		return "pending"
+	}
+}
+
 func mapOperation(remote operationJSON) (Operation, error) {
 	if remote.ID == nil {
 		return Operation{}, errors.New("Houston operation has no id")
@@ -1060,7 +1087,10 @@ func (m *Manager) doJSON(
 
 	if result.StatusCode < http.StatusOK || result.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(result.Body, 64<<10))
-		return "", fmt.Errorf("Houston returned %s: %s", result.Status, strings.TrimSpace(string(message)))
+		return "", &HoustonError{
+			StatusCode: result.StatusCode,
+			Message:    fmt.Sprintf("Houston returned %s: %s", result.Status, strings.TrimSpace(string(message))),
+		}
 	}
 	if response != nil && result.StatusCode != http.StatusNoContent {
 		if err := json.NewDecoder(result.Body).Decode(response); err != nil {
