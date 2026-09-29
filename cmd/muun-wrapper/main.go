@@ -32,7 +32,7 @@ func main() {
 
 func run(args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: muun-wrapper <server|create|address|balance|operations|invoice|invoice-status|send|sync|recovery-code|recovery-setup|emergency-kit>")
+		return errors.New("usage: muun-wrapper <server|create|address|balance|operations|operation|invoice|invoice-status|send-preview|send|send-status|send-reconcile|sync|recovery-code|recovery-setup|emergency-kit>")
 	}
 
 	switch args[0] {
@@ -41,7 +41,7 @@ func run(args []string, output io.Writer) error {
 	case "recovery-code":
 		_, err := fmt.Fprintln(output, libwallet.GenerateRecoveryCode())
 		return err
-	case "create", "address", "balance", "operations", "invoice", "invoice-status", "send", "sync", "recovery-setup", "emergency-kit":
+	case "create", "address", "balance", "operations", "operation", "invoice", "invoice-status", "send-preview", "send", "send-status", "send-reconcile", "sync", "recovery-setup", "emergency-kit":
 		return runClientCommand(args[0], args[1:], output)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
@@ -56,6 +56,9 @@ func runClientCommand(command string, args []string, output io.Writer) error {
 	amountSatoshis := flags.Int64("amount-sats", 0, "amount for a Lightning invoice in satoshis")
 	destination := flags.String("destination", "", "Bitcoin payment destination")
 	description := flags.String("description", "", "payment description")
+	method := flags.String("method", "", "payment method: onchain or lightning")
+	idempotencyKey := flags.String("idempotency-key", "", "persistent idempotency key for a send")
+	operationID := flags.Int64("operation-id", 0, "Houston operation id")
 	recoveryCodeFile := flags.String("recovery-code-file", "", "path to a recovery code file")
 	paymentHash := flags.String("payment-hash", "", "payment hash of an issued Lightning invoice")
 	if err := flags.Parse(args); err != nil {
@@ -77,6 +80,11 @@ func runClientCommand(command string, args []string, output io.Writer) error {
 		result, err = apiClient.Balance(ctx)
 	case "operations":
 		result, err = apiClient.Operations(ctx)
+	case "operation":
+		if *operationID <= 0 {
+			return errors.New("operation requires --operation-id greater than zero")
+		}
+		result, err = apiClient.Operation(ctx, *operationID)
 	case "invoice":
 		if *amountSatoshis <= 0 {
 			return errors.New("invoice requires --amount-sats greater than zero")
@@ -87,6 +95,14 @@ func runClientCommand(command string, args []string, output io.Writer) error {
 			return errors.New("invoice-status requires --payment-hash")
 		}
 		result, err = apiClient.InvoiceStatus(ctx, *paymentHash)
+	case "send-preview":
+		if *amountSatoshis <= 0 {
+			return errors.New("send-preview requires --amount-sats greater than zero")
+		}
+		if *method != "" && *method != "onchain" && *method != "lightning" {
+			return errors.New("send-preview --method must be onchain or lightning")
+		}
+		result, err = apiClient.PreviewSend(ctx, wallet.SendPreviewRequest{Destination: *destination, AmountSatoshis: *amountSatoshis, Method: *method})
 	case "send":
 		if strings.TrimSpace(*destination) == "" {
 			return errors.New("send requires --destination")
@@ -98,7 +114,18 @@ func runClientCommand(command string, args []string, output io.Writer) error {
 			Destination:    *destination,
 			AmountSatoshis: *amountSatoshis,
 			Description:    *description,
+			IdempotencyKey: *idempotencyKey,
 		})
+	case "send-status":
+		if strings.TrimSpace(*idempotencyKey) == "" {
+			return errors.New("send-status requires --idempotency-key")
+		}
+		result, err = apiClient.SendStatus(ctx, *idempotencyKey)
+	case "send-reconcile":
+		if strings.TrimSpace(*idempotencyKey) == "" {
+			return errors.New("send-reconcile requires --idempotency-key")
+		}
+		result, err = apiClient.ReconcileSend(ctx, *idempotencyKey)
 	case "sync":
 		result, err = apiClient.Sync(ctx)
 	case "recovery-setup":

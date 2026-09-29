@@ -329,3 +329,32 @@ func writeSyncResult(t *testing.T, writer http.ResponseWriter, status int, resul
 		t.Fatal(err)
 	}
 }
+
+func TestSendStatusEscapesSlashInsideIdempotencyKey(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/send/status/transfer%2F1" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.EscapedPath())
+		}
+		if r.Header.Get("Authorization") != "Bearer api-token" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(wallet.SendStatus{State: wallet.SendInFlight}); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	defer server.Close()
+
+	api, err := New(server.URL, "api-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := api.SendStatus(context.Background(), "transfer/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != wallet.SendInFlight {
+		t.Fatalf("status = %#v", status)
+	}
+}

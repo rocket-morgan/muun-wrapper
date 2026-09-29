@@ -377,6 +377,7 @@ func TestOperationsReturnsHoustonOperationHistory(t *testing.T) {
 	t.Parallel()
 
 	muunKey := mustBaseKey(t, bytes.Repeat([]byte{9}, 32))
+	transactionID := "transaction-id"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/houston/sessions-v2/first":
@@ -406,6 +407,8 @@ func TestOperationsReturnsHoustonOperationHistory(t *testing.T) {
 					"id":              42,
 					"direction":       "INCOMING",
 					"status":          "CONFIRMED",
+					"creationDate":    "2026-09-28T01:02:03-03:00",
+					"confirmations":   3,
 					"receiverAddress": "bc1pdeposit",
 					"amount":          map[string]int64{"inSatoshis": 25_000},
 					"fee":             map[string]int64{"inSatoshis": 100},
@@ -441,14 +444,101 @@ func TestOperationsReturnsHoustonOperationHistory(t *testing.T) {
 		ID:              42,
 		Direction:       "INCOMING",
 		Status:          "CONFIRMED",
+		PaymentState:    "paid",
+		CreatedAt:       "2026-09-28T04:02:03Z",
 		AmountSatoshis:  25_000,
 		FeeSatoshis:     100,
-		Confirmations:   2,
-		TransactionID:   "transaction-id",
+		Confirmations:   3,
+		TransactionID:   &transactionID,
 		ReceiverAddress: "bc1pdeposit",
 	}}
 	if !reflect.DeepEqual(operations, want) {
 		t.Fatalf("operations = %#v, want %#v", operations, want)
+	}
+}
+
+func TestOperationsExposeHoustonDatesAndOnchainFieldsButNullLightningTransaction(t *testing.T) {
+	t.Parallel()
+
+	muunKey := mustBaseKey(t, bytes.Repeat([]byte{14}, 32))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/houston/sessions-v2/first":
+			w.Header().Set("Authorization", "Bearer session-token")
+			writeJSON(t, w, map[string]any{
+				"cosigningPublicKey":  map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+				"swapServerPublicKey": map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+			})
+		case "/houston/user/external-addresses-record":
+			if r.Method == http.MethodGet {
+				writeJSON(t, w, map[string]int{"maxUsedIndex": -1, "maxWatchingIndex": 100})
+				return
+			}
+			writeJSON(t, w, map[string]int{"maxUsedIndex": 0, "maxWatchingIndex": 100})
+		case "/houston/operations":
+			writeJSON(t, w, []map[string]any{
+				{
+					"id":              101,
+					"direction":       "INCOMING",
+					"status":          "CONFIRMED",
+					"creationDate":    "2026-09-28T01:02:03-03:00",
+					"receiverAddress": "bc1ponchainreceive",
+					"confirmations":   4,
+					"amount":          map[string]int64{"inSatoshis": 4_000},
+					"fee":             map[string]int64{"inSatoshis": 0},
+					"transaction":     map[string]any{"hash": "incoming-onchain-tx", "confirmations": 2},
+				},
+				{
+					"id":           102,
+					"direction":    "OUTGOING",
+					"status":       "SWAP_PENDING",
+					"creationDate": "2026-09-28T06:02:03Z",
+					"swapUuid":     "outgoing-lightning-swap",
+					"amount":       map[string]int64{"inSatoshis": 5_000},
+					"fee":          map[string]int64{"inSatoshis": 25},
+					"transaction":  map[string]any{"hash": "funding-tx-not-a-lightning-id", "confirmations": 0},
+				},
+			})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, err := wallet.NewManager(wallet.Config{
+		DataDir:           t.TempDir(),
+		Passphrase:        "test passphrase",
+		HoustonURL:        server.URL + "/houston/",
+		PrimaryCurrency:   "USD",
+		ClientVersion:     1511,
+		ClientVersionName: "55.11",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	operations, err := manager.Operations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 2 {
+		t.Fatalf("operations = %d, want 2", len(operations))
+	}
+	if operations[0].CreatedAt != "2026-09-28T04:02:03Z" || operations[0].PaymentState != "paid" || operations[0].TransactionID == nil || *operations[0].TransactionID != "incoming-onchain-tx" || operations[0].Confirmations != 4 || operations[0].ReceiverAddress != "bc1ponchainreceive" {
+		t.Fatalf("onchain operation = %#v", operations[0])
+	}
+	if operations[1].CreatedAt != "2026-09-28T06:02:03Z" || operations[1].PaymentState != "pending" || operations[1].TransactionID != nil || operations[1].Confirmations != 0 {
+		t.Fatalf("lightning operation = %#v", operations[1])
+	}
+	detail, err := manager.Operation(context.Background(), 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(detail, operations[0]) {
+		t.Fatalf("detail = %#v, want %#v", detail, operations[0])
 	}
 }
 
@@ -793,11 +883,12 @@ func TestInvoiceStatusTracksSettlementOfAnIssuedInvoice(t *testing.T) {
 
 	incomingOperation := func(preimageHex string) []map[string]any {
 		return []map[string]any{{
-			"id":        float64(77),
-			"direction": "INCOMING",
-			"status":    "CONFIRMED",
-			"amount":    map[string]any{"inSatoshis": amount},
-			"fee":       map[string]any{"inSatoshis": 0},
+			"id":           float64(77),
+			"direction":    "INCOMING",
+			"status":       "CONFIRMED",
+			"creationDate": "2026-09-28T00:00:00Z",
+			"amount":       map[string]any{"inSatoshis": amount},
+			"fee":          map[string]any{"inSatoshis": 0},
 			"incomingSwap": map[string]any{
 				"uuid":           "swap-uuid",
 				"paymentHashHex": invoice.PaymentHash,
@@ -880,11 +971,12 @@ func TestOperationsSurfaceIncomingSwapPaymentHashAndPreimage(t *testing.T) {
 			}
 		case "/houston/operations":
 			writeJSON(t, w, []map[string]any{{
-				"id":        float64(91),
-				"direction": "INCOMING",
-				"status":    "CONFIRMED",
-				"amount":    map[string]any{"inSatoshis": 4_000},
-				"fee":       map[string]any{"inSatoshis": 0},
+				"id":           float64(91),
+				"direction":    "INCOMING",
+				"status":       "CONFIRMED",
+				"creationDate": "2026-09-28T00:00:00Z",
+				"amount":       map[string]any{"inSatoshis": 4_000},
+				"fee":          map[string]any{"inSatoshis": 0},
 				"incomingSwap": map[string]any{
 					"uuid":           "swap-uuid",
 					"paymentHashHex": paymentHash,

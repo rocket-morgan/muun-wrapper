@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jinzhu/gorm"
@@ -98,21 +99,27 @@ type SyncResult struct {
 	FulfilledIncomingSwaps int `json:"fulfilledIncomingSwaps"`
 }
 
-// Operation is a stable, wallet-facing view of one Houston operation.
+// Operation is a stable, wallet-facing view of one Houston operation. GET /operations and
+// GET /operations/{id} share this shape so a backend can correlate deposits and withdrawals.
 type Operation struct {
-	ID              int64  `json:"id"`
-	Direction       string `json:"direction,omitempty"`
-	Status          string `json:"status"`
-	AmountSatoshis  int64  `json:"amountSatoshis"`
-	FeeSatoshis     int64  `json:"feeSatoshis"`
-	Confirmations   int64  `json:"confirmations"`
-	TransactionID   string `json:"transactionId,omitempty"`
-	ReceiverAddress string `json:"receiverAddress,omitempty"`
+	ID              int64   `json:"id"`
+	Direction       string  `json:"direction,omitempty"`
+	Status          string  `json:"status"`
+	PaymentState    string  `json:"paymentState"`
+	CreatedAt       string  `json:"createdAt"`
+	AmountSatoshis  int64   `json:"amountSatoshis"`
+	FeeSatoshis     int64   `json:"feeSatoshis"`
+	Confirmations   int64   `json:"confirmations"`
+	TransactionID   *string `json:"transactionId"`
+	ReceiverAddress string  `json:"receiverAddress,omitempty"`
 	// PaymentHash and Preimage are only present on incoming Lightning swaps. A non-empty Preimage
 	// proves the payment settled.
 	PaymentHash string `json:"paymentHash,omitempty"`
 	Preimage    string `json:"preimage,omitempty"`
 }
+
+// OperationDetail is the same wallet-facing operation used by GET /operations/{id}.
+type OperationDetail = Operation
 
 // Manager owns one encrypted Muun wallet in Config.DataDir.
 type Manager struct {
@@ -121,6 +128,7 @@ type Manager struct {
 	invoicePool             *walletdb.Pool
 	receiveMu               sync.Mutex
 	sendMu                  sync.Mutex
+	sendIdempotency         *sendIdempotencyStore
 	recoveryMu              sync.Mutex
 	signOutgoingTransaction outgoingTransactionSigner
 }
@@ -249,14 +257,19 @@ type sizeForAmount struct {
 }
 
 type operationJSON struct {
-	ID              *int64            `json:"id"`
-	Direction       string            `json:"direction"`
-	Status          string            `json:"status"`
-	ReceiverAddress string            `json:"receiverAddress"`
-	Amount          *satoshiAmount    `json:"amount"`
-	Fee             *satoshiAmount    `json:"fee"`
-	Transaction     *transaction      `json:"transaction"`
-	IncomingSwap    *incomingSwapJSON `json:"incomingSwap"`
+	ID              *int64             `json:"id"`
+	RequestID       string             `json:"requestId,omitempty"`
+	Direction       string             `json:"direction"`
+	Status          string             `json:"status"`
+	ReceiverAddress string             `json:"receiverAddress"`
+	CreationDate    string             `json:"creationDate"`
+	Confirmations   *int64             `json:"confirmations"`
+	SwapUUID        string             `json:"swapUuid,omitempty"`
+	Amount          *satoshiAmount     `json:"amount"`
+	Fee             *satoshiAmount     `json:"fee"`
+	Transaction     *transaction       `json:"transaction"`
+	IncomingSwap    *incomingSwapJSON  `json:"incomingSwap"`
+	Swap            *submarineSwapJSON `json:"swap"`
 }
 
 type moneyAmount struct {
@@ -304,6 +317,7 @@ func NewManager(config Config) (*Manager, error) {
 	return &Manager{
 		config:                  config,
 		client:                  http.DefaultClient,
+		sendIdempotency:         newSendIdempotencyStore(config.DataDir),
 		signOutgoingTransaction: signPartiallySignedTransaction,
 	}, nil
 }
@@ -854,6 +868,23 @@ func (m *Manager) registerInvoiceSecrets(ctx context.Context, token string, secr
 	return nil
 }
 
+// mapPaymentState follows Apollo's outgoing-operation classification. Unknown future
+// Houston statuses remain pending rather than being misreported as paid or failed.
+func mapPaymentState(status string) string {
+	switch strings.ToUpper(status) {
+	case "CONFIRMED", "SETTLED", "SWAP_PAYED":
+		return "paid"
+	case "DROPPED", "FAILED", "SWAP_FAILED":
+		return "failed"
+	case "SWAP_EXPIRED":
+		return "expired"
+	case "CREATED", "SIGNING", "SIGNED", "BROADCASTED", "SWAP_PENDING", "SWAP_ROUTING", "SWAP_OPENING_CHANNEL", "SWAP_WAITING_CHANNEL":
+		return "pending"
+	default:
+		return "pending"
+	}
+}
+
 func mapOperation(remote operationJSON) (Operation, error) {
 	if remote.ID == nil {
 		return Operation{}, errors.New("Houston operation has no id")
@@ -870,26 +901,66 @@ func mapOperation(remote operationJSON) (Operation, error) {
 	if *remote.Amount.InSatoshis < 0 || *remote.Fee.InSatoshis < 0 {
 		return Operation{}, errors.New("Houston operation has a negative amount or fee")
 	}
+	createdAt, err := houstonCreationDate(remote.CreationDate)
+	if err != nil {
+		return Operation{}, err
+	}
 
 	operation := Operation{
 		ID:              *remote.ID,
 		Direction:       remote.Direction,
 		Status:          remote.Status,
+		PaymentState:    mapPaymentState(remote.Status),
+		CreatedAt:       createdAt,
 		AmountSatoshis:  *remote.Amount.InSatoshis,
 		FeeSatoshis:     *remote.Fee.InSatoshis,
 		ReceiverAddress: remote.ReceiverAddress,
 	}
-	if remote.Transaction != nil {
-		operation.TransactionID = remote.Transaction.Hash
-		if remote.Transaction.Confirmations != nil {
-			operation.Confirmations = *remote.Transaction.Confirmations
-		}
+	if txid, confirmations, ok := onchainTransaction(remote); ok {
+		operation.TransactionID = &txid
+		operation.Confirmations = confirmations
 	}
 	if remote.IncomingSwap != nil {
 		operation.PaymentHash = remote.IncomingSwap.PaymentHashHex
 		operation.Preimage = remote.IncomingSwap.PreimageHex
 	}
 	return operation, nil
+}
+
+func houstonCreationDate(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("Houston operation has no creationDate")
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return "", fmt.Errorf("Houston operation has an invalid creationDate: %w", err)
+	}
+	return parsed.UTC().Format(time.RFC3339Nano), nil
+}
+
+func onchainTransaction(remote operationJSON) (string, int64, bool) {
+	if remote.IncomingSwap != nil || remote.Swap != nil || remote.SwapUUID != "" || remote.Transaction == nil {
+		return "", 0, false
+	}
+	txid := strings.TrimSpace(remote.Transaction.Hash)
+	if txid == "" {
+		return "", 0, false
+	}
+	confirmations := int64(0)
+	if remote.Confirmations != nil {
+		confirmations = *remote.Confirmations
+	} else if remote.Transaction.Confirmations != nil {
+		confirmations = *remote.Transaction.Confirmations
+	}
+	return txid, confirmations, true
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func newBasePrivateKey() (*libwallet.HDPrivateKey, error) {
@@ -1060,7 +1131,10 @@ func (m *Manager) doJSON(
 
 	if result.StatusCode < http.StatusOK || result.StatusCode >= http.StatusMultipleChoices {
 		message, _ := io.ReadAll(io.LimitReader(result.Body, 64<<10))
-		return "", fmt.Errorf("Houston returned %s: %s", result.Status, strings.TrimSpace(string(message)))
+		return "", &HoustonError{
+			StatusCode: result.StatusCode,
+			Message:    fmt.Sprintf("Houston returned %s: %s", result.Status, strings.TrimSpace(string(message))),
+		}
 	}
 	if response != nil && result.StatusCode != http.StatusNoContent {
 		if err := json.NewDecoder(result.Body).Decode(response); err != nil {

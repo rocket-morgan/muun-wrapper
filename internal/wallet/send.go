@@ -1,8 +1,10 @@
 package wallet
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -12,8 +14,10 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/google/uuid"
 	libwallet "github.com/muun/libwallet"
+	"github.com/muun/libwallet/btcsuitew/btcutilw"
 	"github.com/muun/libwallet/fees"
 	"github.com/muun/libwallet/operation"
 )
@@ -23,6 +27,7 @@ type SendRequest struct {
 	Destination    string `json:"destination"`
 	AmountSatoshis int64  `json:"amountSatoshis"`
 	Description    string `json:"description,omitempty"`
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 }
 
 // SendResult identifies the operation and transaction accepted by Houston.
@@ -31,6 +36,7 @@ type SendResult struct {
 	TransactionID  string `json:"transactionId"`
 	AmountSatoshis int64  `json:"amountSatoshis"`
 	FeeSatoshis    int64  `json:"feeSatoshis"`
+	PaymentHash    string `json:"paymentHash,omitempty"`
 }
 
 type outgoingTransactionSigner func(
@@ -220,8 +226,373 @@ func (i walletInput) IncomingSwap() libwallet.InputIncomingSwap {
 }
 func (i walletInput) MuunPublicNonce() []byte { return i.muunPublicNonce }
 
-// Send creates, signs, and broadcasts an on-chain payment or a Lightning submarine swap.
+// Send executes a payment. Call SendWithOutcome when the caller must distinguish a replay.
 func (m *Manager) Send(ctx context.Context, request SendRequest) (SendResult, error) {
+	outcome, err := m.SendWithOutcome(ctx, request)
+	return outcome.Result, err
+}
+
+// SendOutcome contains a submitted result and whether it was served from the persistent replay
+// record rather than sent to Houston again.
+type SendOutcome struct {
+	Result SendResult
+	Replay bool
+}
+
+// SendStatus is the wallet-facing state of a persistent idempotency key.
+type SendStatus struct {
+	State  SendIdempotencyState `json:"state"`
+	Result *SendResult          `json:"result,omitempty"`
+}
+
+// SendError preserves whether a send may have reached Houston. Pre-submit errors are safe for a
+// client to correct and retry; submitted errors deliberately leave keyed requests in_flight.
+type SendError struct {
+	Cause     error
+	Submitted bool
+}
+
+func (e *SendError) Error() string { return e.Cause.Error() }
+func (e *SendError) Unwrap() error { return e.Cause }
+
+// HoustonError retains a non-success HTTP status so the API can distinguish an expired Houston
+// session before an outgoing operation is submitted.
+type HoustonError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *HoustonError) Error() string { return e.Message }
+
+func IsHoustonSessionError(err error) bool {
+	var houstonError *HoustonError
+	return errors.As(err, &houstonError) && (houstonError.StatusCode == http.StatusUnauthorized || houstonError.StatusCode == http.StatusForbidden)
+}
+
+type sendAttempt struct {
+	submitted bool
+}
+
+// SendWithOutcome executes an outgoing send and durably applies the idempotency contract when
+// IdempotencyKey is supplied.
+func (m *Manager) SendWithOutcome(ctx context.Context, request SendRequest) (SendOutcome, error) {
+	request.IdempotencyKey = strings.TrimSpace(request.IdempotencyKey)
+	if len(request.IdempotencyKey) > 128 {
+		return SendOutcome{}, &SendError{Cause: errors.New("idempotency key must be at most 128 characters")}
+	}
+
+	requestID := uuid.NewString()
+	keyed := request.IdempotencyKey != ""
+	if keyed {
+		record, replay, err := m.sendIdempotency.start(request.IdempotencyKey, sendRequestHash(request))
+		if err != nil {
+			return SendOutcome{}, &SendError{Cause: err}
+		}
+		if replay {
+			var result SendResult
+			if err := json.Unmarshal(record.Result, &result); err != nil {
+				return SendOutcome{}, &SendError{Cause: fmt.Errorf("decode persisted send result: %w", err)}
+			}
+			return SendOutcome{Result: result, Replay: true}, nil
+		}
+		requestID = record.RequestID
+		defer m.sendIdempotency.deactivate(request.IdempotencyKey)
+	}
+
+	attempt := &sendAttempt{}
+	result, err := m.send(ctx, request, requestID, attempt)
+	if err != nil {
+		if keyed && !attempt.submitted {
+			if storeErr := m.sendIdempotency.failedPreSubmit(request.IdempotencyKey); storeErr != nil {
+				return SendOutcome{}, &SendError{Cause: fmt.Errorf("record failed pre-submit send: %w", storeErr)}
+			}
+		}
+		return SendOutcome{}, &SendError{Cause: err, Submitted: attempt.submitted}
+	}
+	if keyed {
+		if err := m.sendIdempotency.done(request.IdempotencyKey, result); err != nil {
+			// The operation may already exist in Houston; keep in_flight to block a duplicate.
+			return SendOutcome{}, &SendError{Cause: fmt.Errorf("persist submitted send result: %w", err), Submitted: true}
+		}
+	}
+	return SendOutcome{Result: result}, nil
+}
+
+// SendStatus returns a local durable idempotency state without contacting Houston.
+func (m *Manager) SendStatus(_ context.Context, key string) (SendStatus, error) {
+	record, err := m.sendIdempotency.get(strings.TrimSpace(key))
+	if err != nil {
+		return SendStatus{}, err
+	}
+	status := SendStatus{State: record.State}
+	if record.State == SendDone {
+		var result SendResult
+		if err := json.Unmarshal(record.Result, &result); err != nil {
+			return SendStatus{}, fmt.Errorf("decode persisted send result: %w", err)
+		}
+		status.Result = &result
+	}
+	return status, nil
+}
+
+// ReconcileSend checks Houston's operation history for the deterministic requestId associated
+// with an in-flight key. It makes the key retryable only when that history exposes requestIds and
+// proves this requestId absent; otherwise it preserves in_flight to avoid a duplicate payment.
+func (m *Manager) ReconcileSend(ctx context.Context, key string) (SendStatus, error) {
+	key = strings.TrimSpace(key)
+	record, err := m.sendIdempotency.get(key)
+	if err != nil {
+		return SendStatus{}, err
+	}
+	if record.State != SendInFlight {
+		return m.SendStatus(ctx, key)
+	}
+	active, err := m.sendIdempotency.activeSend(key)
+	if err != nil {
+		return SendStatus{}, err
+	}
+	if active {
+		return SendStatus{}, ErrSendInProgress
+	}
+
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
+	// Reload after acquiring the send lock so a concurrently finishing sender wins.
+	record, err = m.sendIdempotency.get(key)
+	if err != nil {
+		return SendStatus{}, err
+	}
+	if record.State != SendInFlight {
+		return m.SendStatus(ctx, key)
+	}
+
+	walletRecord, err := m.loadRecord()
+	if err != nil {
+		return SendStatus{}, err
+	}
+	var remote []operationJSON
+	if _, err := m.doJSON(ctx, http.MethodGet, "operations", walletRecord.SessionToken, nil, &remote); err != nil {
+		return SendStatus{}, err
+	}
+	hasRequestID := false
+	for _, operation := range remote {
+		if operation.RequestID != "" {
+			hasRequestID = true
+		}
+		if operation.RequestID != record.RequestID {
+			continue
+		}
+		mapped, err := mapOperation(operation)
+		if err != nil {
+			return SendStatus{}, fmt.Errorf("map reconciled operation: %w", err)
+		}
+		result := SendResult{
+			OperationID:    mapped.ID,
+			TransactionID:  stringValue(mapped.TransactionID),
+			AmountSatoshis: mapped.AmountSatoshis,
+			FeeSatoshis:    mapped.FeeSatoshis,
+			PaymentHash:    outgoingSwapPaymentHash(operation),
+		}
+		if err := m.sendIdempotency.done(key, result); err != nil {
+			return SendStatus{}, fmt.Errorf("persist reconciled send: %w", err)
+		}
+		return SendStatus{State: SendDone, Result: &result}, nil
+	}
+	if !hasRequestID {
+		return SendStatus{}, ErrHoustonRequestIDUnavailable
+	}
+	if err := m.sendIdempotency.failedPreSubmit(key); err != nil {
+		return SendStatus{}, fmt.Errorf("mark missing Houston operation retryable: %w", err)
+	}
+	return SendStatus{State: SendFailedPreSubmit}, nil
+}
+
+func outgoingSwapPaymentHash(operation operationJSON) string {
+	if operation.Swap == nil {
+		return ""
+	}
+	return strings.TrimSpace(operation.Swap.FundingOutputData.ServerPaymentHashInHex)
+}
+
+// ErrUnknownOperation reports an operation id absent from Houston's current history.
+var ErrUnknownOperation = errors.New("unknown operation")
+
+// ErrHoustonRequestIDUnavailable means Houston's history cannot prove that an in-flight send is
+// absent, so retrying it would risk a duplicate payment.
+var ErrHoustonRequestIDUnavailable = errors.New("Houston operation history does not expose requestId")
+
+// Operation returns one operation enriched with a normalized payment state.
+func (m *Manager) Operation(ctx context.Context, id int64) (OperationDetail, error) {
+	if id <= 0 {
+		return OperationDetail{}, ErrUnknownOperation
+	}
+	record, err := m.loadRecord()
+	if err != nil {
+		return OperationDetail{}, err
+	}
+	var remote []operationJSON
+	if _, err := m.doJSON(ctx, http.MethodGet, "operations", record.SessionToken, nil, &remote); err != nil {
+		return OperationDetail{}, fmt.Errorf("fetch operations: %w", err)
+	}
+	for _, candidate := range remote {
+		if candidate.ID == nil || *candidate.ID != id {
+			continue
+		}
+		operation, err := mapOperation(candidate)
+		if err != nil {
+			return OperationDetail{}, fmt.Errorf("map operation %d: %w", id, err)
+		}
+		return operation, nil
+	}
+	return OperationDetail{}, ErrUnknownOperation
+}
+
+// SendPreviewRequest estimates a send without signing or broadcasting an outgoing operation.
+type SendPreviewRequest struct {
+	Destination    string `json:"destination,omitempty"`
+	AmountSatoshis int64  `json:"amountSatoshis"`
+	Method         string `json:"method,omitempty"`
+}
+
+// SendPreview reports the fee breakdown calculated from current Houston realtime data.
+type SendPreview struct {
+	Method             string `json:"method"`
+	AmountSatoshis     int64  `json:"amountSatoshis"`
+	FeeSatoshis        int64  `json:"feeSatoshis"`
+	RoutingFeeSatoshis *int64 `json:"routingFeeSatoshis,omitempty"`
+	SweepFeeSatoshis   *int64 `json:"sweepFeeSatoshis,omitempty"`
+	TotalSatoshis      int64  `json:"totalSatoshis"`
+}
+
+func syntheticPreviewTaprootOutput() (string, error) {
+	// Placeholder P2TR output for a destination-independent quote; never signed or broadcast.
+	address, err := btcutilw.NewAddressTaprootKey(bytes.Repeat([]byte{1}, 32), &chaincfg.MainNetParams)
+	if err != nil {
+		return "", fmt.Errorf("create synthetic Taproot preview output: %w", err)
+	}
+	return address.EncodeAddress(), nil
+}
+
+// PreviewSend calculates an on-chain or Lightning send quote without signing, creating an
+// operation, or broadcasting a transaction. Lightning preview asks Houston to build and validate
+// its submarine swap because that is the source of the routing and sweep fees.
+func (m *Manager) PreviewSend(ctx context.Context, request SendPreviewRequest) (SendPreview, error) {
+	if request.AmountSatoshis <= 0 {
+		return SendPreview{}, errors.New("payment amount must be positive")
+	}
+	method := strings.ToLower(strings.TrimSpace(request.Method))
+	if method != "" && method != "onchain" && method != "lightning" {
+		return SendPreview{}, errors.New("preview method must be onchain or lightning")
+	}
+	if method == "" {
+		method = "onchain"
+		if strings.TrimSpace(request.Destination) != "" {
+			if invoice, err := libwallet.ParseInvoice(request.Destination, libwallet.Mainnet()); err == nil && invoice != nil {
+				method = "lightning"
+			} else if uri, err := libwallet.GetPaymentURI(request.Destination, libwallet.Mainnet()); err == nil && uri.Invoice != nil {
+				method = "lightning"
+			}
+		}
+	}
+
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
+	record, err := m.loadRecord()
+	if err != nil {
+		return SendPreview{}, err
+	}
+	if method == "onchain" {
+		destination := strings.TrimSpace(request.Destination)
+		if destination == "" {
+			var err error
+			destination, err = syntheticPreviewTaprootOutput()
+			if err != nil {
+				return SendPreview{}, err
+			}
+		}
+		uri, err := libwallet.GetPaymentURI(destination, libwallet.Mainnet())
+		if err != nil || uri.Invoice != nil || uri.Address == "" || uri.Amount != "" {
+			return SendPreview{}, errors.New("preview onchain destination must be a Bitcoin address without a BIP21 amount")
+		}
+		realtime, err := m.fetchRealtime(ctx, record.SessionToken)
+		if err != nil {
+			return SendPreview{}, err
+		}
+		nextSize, err := m.fetchNextTransactionSize(ctx, record.SessionToken)
+		if err != nil {
+			return SendPreview{}, err
+		}
+		analysis, _, _, err := analyzeOnchainPayment(request.AmountSatoshis, realtime, nextSize)
+		if err != nil {
+			return SendPreview{}, err
+		}
+		return SendPreview{
+			Method:         "onchain",
+			AmountSatoshis: analysis.AmountInSat,
+			FeeSatoshis:    analysis.FeeTotalInSat,
+			TotalSatoshis:  analysis.AmountInSat + analysis.FeeTotalInSat,
+		}, nil
+	}
+
+	if strings.TrimSpace(request.Destination) == "" {
+		return SendPreview{}, errors.New("Lightning preview requires a payment destination")
+	}
+	invoice, err := libwallet.ParseInvoice(request.Destination, libwallet.Mainnet())
+	if err != nil || invoice == nil {
+		return SendPreview{}, errors.New("preview Lightning destination must be a BOLT11 invoice")
+	}
+	if invoice.Sats <= 0 {
+		return SendPreview{}, errors.New("Lightning invoice has no amount")
+	}
+	if invoice.Sats != request.AmountSatoshis {
+		return SendPreview{}, fmt.Errorf("Lightning invoice amount is %d satoshis, not %d", invoice.Sats, request.AmountSatoshis)
+	}
+	if invoice.Expiry <= time.Now().Unix() {
+		return SendPreview{}, errors.New("Lightning invoice has expired")
+	}
+	basePrivateKey, err := m.decryptBasePrivateKey(record)
+	if err != nil {
+		return SendPreview{}, err
+	}
+	muunPublicKey, err := libwallet.NewHDPublicKeyFromString(record.MuunCosigningPublicKey, basePath, libwallet.Mainnet())
+	if err != nil {
+		return SendPreview{}, fmt.Errorf("decode Muun cosigning key: %w", err)
+	}
+	var remoteSwap submarineSwapJSON
+	if _, err := m.doJSON(ctx, http.MethodPost, "operations/sswap/create", record.SessionToken, submarineSwapRequest{
+		Invoice: invoice.RawInvoice, SwapExpirationInBlocks: submarineSwapExpirationInBlocks, Origin: "manual", BackgroundTimes: []any{},
+	}, &remoteSwap); err != nil {
+		return SendPreview{}, fmt.Errorf("create Lightning swap: %w", err)
+	}
+	swapFees, err := verifySubmarineSwap(invoice, remoteSwap, basePrivateKey.PublicKey(), muunPublicKey)
+	if err != nil {
+		return SendPreview{}, err
+	}
+	realtime, err := m.fetchRealtime(ctx, record.SessionToken)
+	if err != nil {
+		return SendPreview{}, err
+	}
+	nextSize, err := m.fetchNextTransactionSize(ctx, record.SessionToken)
+	if err != nil {
+		return SendPreview{}, err
+	}
+	analysis, _, err := analyzeLightningPayment(invoice.Sats, realtime, nextSize, swapFees)
+	if err != nil {
+		return SendPreview{}, err
+	}
+	routingFee := int64(swapFees.RoutingFee)
+	sweepFee := int64(remoteSwap.Fees.SweepInSats)
+	return SendPreview{
+		Method:             "lightning",
+		AmountSatoshis:     analysis.AmountInSat,
+		FeeSatoshis:        analysis.FeeTotalInSat,
+		RoutingFeeSatoshis: &routingFee,
+		SweepFeeSatoshis:   &sweepFee,
+		TotalSatoshis:      analysis.AmountInSat + analysis.FeeTotalInSat,
+	}, nil
+}
+
+func (m *Manager) send(ctx context.Context, request SendRequest, requestID string, attempt *sendAttempt) (SendResult, error) {
 	if strings.TrimSpace(request.Destination) == "" {
 		return SendResult{}, errors.New("payment destination is required")
 	}
@@ -233,7 +604,7 @@ func (m *Manager) Send(ctx context.Context, request SendRequest) (SendResult, er
 	defer m.sendMu.Unlock()
 
 	if invoice, err := libwallet.ParseInvoice(request.Destination, libwallet.Mainnet()); err == nil {
-		return m.sendLightning(ctx, request, invoice)
+		return m.sendLightning(ctx, request, invoice, requestID, attempt)
 	}
 
 	uri, err := libwallet.GetPaymentURI(request.Destination, libwallet.Mainnet())
@@ -241,7 +612,7 @@ func (m *Manager) Send(ctx context.Context, request SendRequest) (SendResult, er
 		return SendResult{}, fmt.Errorf("parse payment destination: %w", err)
 	}
 	if uri.Invoice != nil {
-		return m.sendLightning(ctx, request, uri.Invoice)
+		return m.sendLightning(ctx, request, uri.Invoice, requestID, attempt)
 	}
 	if uri.Address == "" {
 		return SendResult{}, errors.New("payment destination has no Bitcoin address")
@@ -249,7 +620,10 @@ func (m *Manager) Send(ctx context.Context, request SendRequest) (SendResult, er
 	if uri.Amount != "" {
 		return SendResult{}, errors.New("BIP21 amount is not supported; provide amountSatoshis")
 	}
+	return m.sendOnchain(ctx, request, uri.Address, requestID, attempt)
+}
 
+func (m *Manager) sendOnchain(ctx context.Context, request SendRequest, destination, requestID string, attempt *sendAttempt) (SendResult, error) {
 	record, err := m.loadRecord()
 	if err != nil {
 		return SendResult{}, err
@@ -286,11 +660,11 @@ func (m *Manager) Send(ctx context.Context, request SendRequest) (SendResult, er
 	}
 	nonces := libwallet.GenerateMusigNonces(len(outpoints))
 	requestPayload := outgoingOperationRequest{
-		RequestID:                uuid.NewString(),
+		RequestID:                requestID,
 		IsExternal:               true,
 		SenderIsExternal:         false,
 		ReceiverIsExternal:       true,
-		ReceiverAddress:          uri.Address,
+		ReceiverAddress:          destination,
 		Amount:                   amount,
 		Fee:                      fee,
 		OutputAmountInSatoshis:   analysis.AmountInSat,
@@ -303,6 +677,7 @@ func (m *Manager) Send(ctx context.Context, request SendRequest) (SendResult, er
 	}
 
 	var created operationCreatedJSON
+	attempt.submitted = true
 	if _, err := m.doJSON(ctx, http.MethodPost, "operations", record.SessionToken, requestPayload, &created); err != nil {
 		return SendResult{}, fmt.Errorf("create outgoing operation: %w", err)
 	}
@@ -318,19 +693,9 @@ func (m *Manager) Send(ctx context.Context, request SendRequest) (SendResult, er
 
 	var change libwallet.MuunAddress
 	if created.ChangeAddress != nil {
-		change = walletAddress{
-			version:        created.ChangeAddress.Version,
-			derivationPath: created.ChangeAddress.DerivationPath,
-			address:        created.ChangeAddress.Address,
-		}
+		change = walletAddress{version: created.ChangeAddress.Version, derivationPath: created.ChangeAddress.DerivationPath, address: created.ChangeAddress.Address}
 	}
-	expectations := libwallet.NewSigningExpectations(
-		uri.Address,
-		analysis.AmountInSat,
-		change,
-		analysis.FeeTotalInSat+expectedDebt,
-		false,
-	)
+	expectations := libwallet.NewSigningExpectations(destination, analysis.AmountInSat, change, analysis.FeeTotalInSat+expectedDebt, false)
 	signer := m.signOutgoingTransaction
 	if signer == nil {
 		signer = signPartiallySignedTransaction
@@ -343,30 +708,14 @@ func (m *Manager) Send(ctx context.Context, request SendRequest) (SendResult, er
 		return SendResult{}, errors.New("transaction signer returned an empty transaction")
 	}
 
-	push := pushTransactionsRequest{
-		RawTransaction:          &rawTransactionPayload{Hex: hex.EncodeToString(signed.Bytes)},
-		AlternativeTransactions: []rawTransactionPayload{},
-	}
-	if _, err := m.doJSON(
-		ctx,
-		http.MethodPut,
-		"operations/"+strconv.FormatInt(*created.Operation.ID, 10)+"/raw-transactions",
-		record.SessionToken,
-		push,
-		nil,
-	); err != nil {
+	push := pushTransactionsRequest{RawTransaction: &rawTransactionPayload{Hex: hex.EncodeToString(signed.Bytes)}, AlternativeTransactions: []rawTransactionPayload{}}
+	if _, err := m.doJSON(ctx, http.MethodPut, "operations/"+strconv.FormatInt(*created.Operation.ID, 10)+"/raw-transactions", record.SessionToken, push, nil); err != nil {
 		return SendResult{}, fmt.Errorf("push outgoing transaction: %w", err)
 	}
-
-	return SendResult{
-		OperationID:    *created.Operation.ID,
-		TransactionID:  signed.Hash,
-		AmountSatoshis: analysis.AmountInSat,
-		FeeSatoshis:    analysis.FeeTotalInSat,
-	}, nil
+	return SendResult{OperationID: *created.Operation.ID, TransactionID: signed.Hash, AmountSatoshis: analysis.AmountInSat, FeeSatoshis: analysis.FeeTotalInSat}, nil
 }
 
-func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoice *libwallet.Invoice) (SendResult, error) {
+func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoice *libwallet.Invoice, requestID string, attempt *sendAttempt) (SendResult, error) {
 	if invoice == nil {
 		return SendResult{}, errors.New("payment destination has no Lightning invoice")
 	}
@@ -467,7 +816,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 		return SendResult{}, err
 	}
 	requestPayload := outgoingOperationRequest{
-		RequestID:                uuid.NewString(),
+		RequestID:                requestID,
 		Direction:                "OUTGOING",
 		IsExternal:               true,
 		SenderIsExternal:         false,
@@ -486,6 +835,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 	}
 
 	var created operationCreatedJSON
+	attempt.submitted = true
 	if _, err := m.doJSON(ctx, http.MethodPost, "operations", record.SessionToken, requestPayload, &created); err != nil {
 		return SendResult{}, fmt.Errorf("create Lightning operation: %w", err)
 	}
@@ -562,6 +912,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 		TransactionID:  transactionID,
 		AmountSatoshis: analysis.AmountInSat,
 		FeeSatoshis:    analysis.FeeTotalInSat,
+		PaymentHash:    hex.EncodeToString(invoice.PaymentHash),
 	}, nil
 }
 

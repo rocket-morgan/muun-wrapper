@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,7 +40,7 @@ func TestSendOnchainCreatesSignsAndPushesOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var createdOperation bool
+	var createdOperations int
 	var pushedTransaction bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -84,6 +85,7 @@ func TestSendOnchainCreatesSignsAndPushesOperation(t *testing.T) {
 				t.Fatalf("new operation method = %s, want POST", r.Method)
 			}
 			var operation struct {
+				RequestID       string `json:"requestId"`
 				ReceiverAddress string `json:"receiverAddress"`
 				Amount          struct {
 					InSatoshis      int64 `json:"inSatoshis"`
@@ -109,6 +111,9 @@ func TestSendOnchainCreatesSignsAndPushesOperation(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&operation); err != nil {
 				t.Fatal(err)
 			}
+			if operation.RequestID != requestIDForIdempotencyKey("onchain-send-1") {
+				t.Fatalf("operation requestId = %q", operation.RequestID)
+			}
 			if operation.ReceiverAddress != receiverAddress.Address() || operation.Amount.InSatoshis != 10_000 {
 				t.Fatalf("operation receiver=%q amount=%d", operation.ReceiverAddress, operation.Amount.InSatoshis)
 			}
@@ -124,7 +129,7 @@ func TestSendOnchainCreatesSignsAndPushesOperation(t *testing.T) {
 			if len(operation.Outpoints) != 1 || len(operation.UserPublicNoncesHex) != 1 {
 				t.Fatalf("operation outpoints=%v nonces=%v", operation.Outpoints, operation.UserPublicNoncesHex)
 			}
-			createdOperation = true
+			createdOperations++
 			writeTestJSON(t, w, map[string]any{
 				"operation": map[string]any{"id": 42},
 				"partiallySignedTransaction": map[string]any{
@@ -184,19 +189,28 @@ func TestSendOnchainCreatesSignsAndPushesOperation(t *testing.T) {
 		return &libwallet.Transaction{Hash: "broadcast-hash", Bytes: []byte{0xca, 0xfe, 0xba, 0xbe}}, nil
 	}
 
-	result, err := manager.Send(context.Background(), SendRequest{
+	request := SendRequest{
 		Destination:    receiverAddress.Address(),
 		AmountSatoshis: 10_000,
 		Description:    "test payment",
-	})
+		IdempotencyKey: "onchain-send-1",
+	}
+	result, err := manager.Send(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result != (SendResult{OperationID: 42, TransactionID: "broadcast-hash", AmountSatoshis: 10_000, FeeSatoshis: 500}) {
 		t.Fatalf("result = %#v", result)
 	}
-	if !createdOperation || !signed || !pushedTransaction {
-		t.Fatalf("created=%t signed=%t pushed=%t", createdOperation, signed, pushedTransaction)
+	replayed, err := manager.Send(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed != result {
+		t.Fatalf("replayed result = %#v, want %#v", replayed, result)
+	}
+	if createdOperations != 1 || !signed || !pushedTransaction {
+		t.Fatalf("operations=%d signed=%t pushed=%t", createdOperations, signed, pushedTransaction)
 	}
 }
 
@@ -373,7 +387,7 @@ func TestSendLightningCreatesValidatedSwapAndPushesAlternatives(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result != (SendResult{OperationID: 43, TransactionID: "primary-hash", AmountSatoshis: parsedInvoice.Sats, FeeSatoshis: 500}) {
+	if result != (SendResult{OperationID: 43, TransactionID: "primary-hash", AmountSatoshis: parsedInvoice.Sats, FeeSatoshis: 500, PaymentHash: strings.Repeat("11", 32)}) {
 		t.Fatalf("result = %#v", result)
 	}
 	if !createdOperation || !pushedTransactions || signCount != 2 {
@@ -515,7 +529,7 @@ func TestSendLightningLendSwapPushesWithoutOnchainTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result != (SendResult{OperationID: 44, AmountSatoshis: parsedInvoice.Sats, FeeSatoshis: 0}) {
+	if result != (SendResult{OperationID: 44, AmountSatoshis: parsedInvoice.Sats, FeeSatoshis: 0, PaymentHash: strings.Repeat("11", 32)}) {
 		t.Fatalf("result = %#v", result)
 	}
 	if !createdOperation || !pushedWithoutTransaction {

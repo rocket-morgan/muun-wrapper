@@ -258,6 +258,10 @@ type fakeWallet struct {
 	invoiceCalls        int
 	syncCalls           int
 	sendCalls           int
+	previewCalls        int
+	sendStatusCalls     int
+	reconcileSendCalls  int
+	operationCalls      int
 	recoverySetupCalls  int
 	emergencyKitCalls   int
 	createResult        wallet.WalletInfo
@@ -267,6 +271,11 @@ type fakeWallet struct {
 	invoiceResult       wallet.Invoice
 	syncResult          wallet.SyncResult
 	sendResult          wallet.SendResult
+	sendOutcomes        []wallet.SendOutcome
+	previewResult       wallet.SendPreview
+	sendStatusResult    wallet.SendStatus
+	reconcileSendResult wallet.SendStatus
+	operationResult     wallet.OperationDetail
 	recoverySetupResult wallet.RecoverySetup
 	emergencyKitResult  wallet.EmergencyKit
 	createErr           error
@@ -276,10 +285,18 @@ type fakeWallet struct {
 	invoiceErr          error
 	syncErr             error
 	sendErr             error
+	previewErr          error
+	sendStatusErr       error
+	reconcileSendErr    error
+	operationErr        error
 	recoverySetupErr    error
 	emergencyKitErr     error
 	invoiceAmount       *int64
 	sendRequest         wallet.SendRequest
+	previewRequest      wallet.SendPreviewRequest
+	sendStatusKey       string
+	reconcileSendKey    string
+	operationID         int64
 	recoveryCode        string
 	invoiceStatusCalls  int
 	invoiceStatusResult wallet.InvoiceStatus
@@ -324,10 +341,38 @@ func (w *fakeWallet) Sync(context.Context) (wallet.SyncResult, error) {
 	return w.syncResult, w.syncErr
 }
 
-func (w *fakeWallet) Send(_ context.Context, request wallet.SendRequest) (wallet.SendResult, error) {
-	w.sendCalls++
+func (w *fakeWallet) PreviewSend(_ context.Context, request wallet.SendPreviewRequest) (wallet.SendPreview, error) {
+	w.previewCalls++
+	w.previewRequest = request
+	return w.previewResult, w.previewErr
+}
+
+func (w *fakeWallet) SendWithOutcome(_ context.Context, request wallet.SendRequest) (wallet.SendOutcome, error) {
 	w.sendRequest = request
-	return w.sendResult, w.sendErr
+	index := w.sendCalls
+	w.sendCalls++
+	if index < len(w.sendOutcomes) {
+		return w.sendOutcomes[index], w.sendErr
+	}
+	return wallet.SendOutcome{Result: w.sendResult}, w.sendErr
+}
+
+func (w *fakeWallet) SendStatus(_ context.Context, key string) (wallet.SendStatus, error) {
+	w.sendStatusCalls++
+	w.sendStatusKey = key
+	return w.sendStatusResult, w.sendStatusErr
+}
+
+func (w *fakeWallet) ReconcileSend(_ context.Context, key string) (wallet.SendStatus, error) {
+	w.reconcileSendCalls++
+	w.reconcileSendKey = key
+	return w.reconcileSendResult, w.reconcileSendErr
+}
+
+func (w *fakeWallet) Operation(_ context.Context, id int64) (wallet.OperationDetail, error) {
+	w.operationCalls++
+	w.operationID = id
+	return w.operationResult, w.operationErr
 }
 
 func (w *fakeWallet) SetupRecovery(_ context.Context, recoveryCode string) (wallet.RecoverySetup, error) {

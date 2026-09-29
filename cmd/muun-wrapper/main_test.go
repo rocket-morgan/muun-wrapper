@@ -384,3 +384,38 @@ func writeEmergencyKit(t *testing.T, writer http.ResponseWriter, status int, res
 		t.Fatal(err)
 	}
 }
+
+func TestRunSendPreviewPrintsQuoteWithoutDestination(t *testing.T) {
+	t.Parallel()
+	want := wallet.SendPreview{Method: "onchain", AmountSatoshis: 1_000, FeeSatoshis: 10, TotalSatoshis: 1_010}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/send/preview" {
+			t.Fatalf("request = %s %s, want POST /send/preview", r.Method, r.URL.Path)
+		}
+		var request wallet.SendPreviewRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request != (wallet.SendPreviewRequest{AmountSatoshis: 1_000, Method: "onchain"}) {
+			t.Fatalf("request = %#v", request)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(want); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	err := run([]string{"send-preview", "--api-url", server.URL, "--api-token", "api-token", "--amount-sats", "1000", "--method", "onchain"}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result wallet.SendPreview
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result != want {
+		t.Fatalf("result = %#v", result)
+	}
+}
