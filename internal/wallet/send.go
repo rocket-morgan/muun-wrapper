@@ -522,7 +522,7 @@ func (m *Manager) PreviewSend(ctx context.Context, request SendPreviewRequest) (
 		if err != nil {
 			return SendPreview{}, err
 		}
-		analysis, _, _, err := analyzeOnchainPayment(request.AmountSatoshis, realtime, nextSize)
+		analysis, _, err := analyzeOnchainPayment(request.AmountSatoshis, realtime, nextSize)
 		if err != nil {
 			return SendPreview{}, err
 		}
@@ -645,7 +645,7 @@ func (m *Manager) sendOnchain(ctx context.Context, request SendRequest, destinat
 	if err != nil {
 		return SendResult{}, err
 	}
-	analysis, outpoints, expectedDebt, err := analyzeOnchainPayment(request.AmountSatoshis, realtime, nextSize)
+	analysis, outpoints, err := analyzeOnchainPayment(request.AmountSatoshis, realtime, nextSize)
 	if err != nil {
 		return SendResult{}, err
 	}
@@ -695,7 +695,9 @@ func (m *Manager) sendOnchain(ctx context.Context, request SendRequest, destinat
 	if created.ChangeAddress != nil {
 		change = walletAddress{version: created.ChangeAddress.Version, derivationPath: created.ChangeAddress.DerivationPath, address: created.ChangeAddress.Address}
 	}
-	expectations := libwallet.NewSigningExpectations(destination, analysis.AmountInSat, change, analysis.FeeTotalInSat+expectedDebt, false)
+	// Expected debt limits spendable balance, but is not an additional transaction
+	// fee. Match Apollo's signing contract using the operation's actual fee.
+	expectations := libwallet.NewSigningExpectations(destination, analysis.AmountInSat, change, analysis.FeeTotalInSat, false)
 	signer := m.signOutgoingTransaction
 	if signer == nil {
 		signer = signPartiallySignedTransaction
@@ -1123,36 +1125,36 @@ func (m *Manager) fetchNextTransactionSize(ctx context.Context, token string) (n
 	return nextSize, nil
 }
 
-// analyzeOnchainPayment returns the payment analysis, the outpoints to spend, and the debt Houston
-// settles out of the change output of this transaction.
-func analyzeOnchainPayment(amount int64, realtime realtimeData, nextSize nextTransactionSize) (*operation.PaymentAnalysis, []string, int64, error) {
+// analyzeOnchainPayment includes expected debt in the spendable-capacity check,
+// not in the transaction fee used for signature verification.
+func analyzeOnchainPayment(amount int64, realtime realtimeData, nextSize nextTransactionSize) (*operation.PaymentAnalysis, []string, error) {
 	if realtime.FeeWindow == nil || realtime.ExchangeRateWindow == nil {
-		return nil, nil, 0, errors.New("Houston realtime data has no fee or exchange-rate window")
+		return nil, nil, errors.New("Houston realtime data has no fee or exchange-rate window")
 	}
 	if realtime.FeeWindow.FastConfTarget <= 0 {
-		return nil, nil, 0, errors.New("Houston realtime data has an invalid fast confirmation target")
+		return nil, nil, errors.New("Houston realtime data has an invalid fast confirmation target")
 	}
 	feeRate, found := realtime.FeeWindow.TargetedFees[strconv.FormatInt(realtime.FeeWindow.FastConfTarget, 10)]
 	if !found || feeRate <= 0 || math.IsNaN(feeRate) || math.IsInf(feeRate, 0) {
-		return nil, nil, 0, errors.New("Houston realtime data has no valid fast fee rate")
+		return nil, nil, errors.New("Houston realtime data has no valid fast fee rate")
 	}
 	expectedDebt := int64(0)
 	if nextSize.ExpectedDebtInSat != nil {
 		expectedDebt = *nextSize.ExpectedDebtInSat
 	}
 	if expectedDebt < 0 {
-		return nil, nil, 0, errors.New("Houston returned a negative expected debt")
+		return nil, nil, errors.New("Houston returned a negative expected debt")
 	}
 
 	progression := make([]operation.SizeForAmount, 0, len(nextSize.SizeProgression))
 	outpoints := make([]string, 0, len(nextSize.SizeProgression))
 	for index, item := range nextSize.SizeProgression {
 		if item.AmountInSatoshis < 0 || item.SizeInBytes <= 0 || item.Outpoint == "" {
-			return nil, nil, 0, fmt.Errorf("Houston returned an invalid size progression item %d", index)
+			return nil, nil, fmt.Errorf("Houston returned an invalid size progression item %d", index)
 		}
 		status, found := operation.MapUtxoStatus(item.Status)
 		if !found {
-			return nil, nil, 0, fmt.Errorf("Houston returned an unknown UTXO status %q", item.Status)
+			return nil, nil, fmt.Errorf("Houston returned an unknown UTXO status %q", item.Status)
 		}
 		progression = append(progression, operation.SizeForAmount{
 			AmountInSat: item.AmountInSatoshis,
@@ -1163,7 +1165,7 @@ func analyzeOnchainPayment(amount int64, realtime realtimeData, nextSize nextTra
 		outpoints = append(outpoints, item.Outpoint)
 	}
 	if len(progression) == 0 {
-		return nil, nil, 0, errors.New("wallet has no spendable UTXOs")
+		return nil, nil, errors.New("wallet has no spendable UTXOs")
 	}
 
 	analyzer := operation.NewPaymentAnalyzer(
@@ -1176,12 +1178,12 @@ func analyzeOnchainPayment(amount int64, realtime realtimeData, nextSize nextTra
 		FeeRateInSatsPerVByte: feeRate,
 	})
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("analyze on-chain payment: %w", err)
+		return nil, nil, fmt.Errorf("analyze on-chain payment: %w", err)
 	}
 	if analysis.Status != operation.AnalysisStatusOk {
-		return nil, nil, 0, fmt.Errorf("on-chain payment is %s", analysis.Status)
+		return nil, nil, fmt.Errorf("on-chain payment is %s", analysis.Status)
 	}
-	return analysis, outpoints, expectedDebt, nil
+	return analysis, outpoints, nil
 }
 
 func analyzeLightningPayment(

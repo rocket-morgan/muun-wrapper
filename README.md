@@ -186,5 +186,7 @@ onchain y invoices Lightning con monto fijo. Las invoices sin monto quedan fuera
 
 La especificación de la API REST, compatible con Swagger UI y otras herramientas OpenAPI, está en
 [`docs/openapi.json`](docs/openapi.json). La referencia de comandos cliente está en
-[`docs/cli.md`](docs/cli.md). Para operar el stack local usá `./scripts/up.sh` y
+[`docs/cli.md`](docs/cli.md). La corrección de firma y sus gates operativos están en
+[`docs/2026-10-13-payment-signing-repair.md`](docs/2026-10-13-payment-signing-repair.md).
+Para operar el stack local usá `./scripts/up.sh` y
 `./scripts/down.sh`.
