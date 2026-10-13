@@ -4,7 +4,7 @@ La corrección onchain usa la comisión de la operación en las expectativas de
 firma de Apollo. La deuda esperada sigue limitando el saldo y la capacidad de
 pago; no se suma otra vez a la comisión de la transacción.
 
-**Estado:** corrección onchain implementada. La ruta Lightning de salida
+**Estado:** corrección onchain y logs implementados. La ruta Lightning de salida
 mínima está pendiente de demostrar compatibilidad con Houston. No desplegar esta
 branch como una reparación completa ni recuperar órdenes mientras falten esos
 gates.
@@ -32,6 +32,14 @@ Apollo y `PartiallySignedTransaction.Verify` en el commit fijado
 | Negociación | Cero alternativas es una hipótesis pendiente, no una compatibilidad probada por un mock. |
 | Ambigüedad | Un error después de crear la operación conserva `in_flight` y HTTP 502 `submit_failed`. No habilita un retry automático. |
 | Replay | Una clave completada reproduce el resultado persistido, sin otro envío. |
+
+## Logs seguros
+
+Los fallos de creación, firma y push registran `phase`, `request_id`,
+`operation_id`, `error_type` y `houston_status`. La API registra el código y el
+status HTTP de un rechazo. No se escribe el mensaje completo del proveedor:
+puede incluir información privada. Tampoco se registran invoice, destino, clave
+de idempotencia, token, preimage ni material de wallet.
 
 ## Gates operativos antes de producción
 

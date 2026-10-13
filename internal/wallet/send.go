@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"strconv"
@@ -679,6 +680,7 @@ func (m *Manager) sendOnchain(ctx context.Context, request SendRequest, destinat
 	var created operationCreatedJSON
 	attempt.submitted = true
 	if _, err := m.doJSON(ctx, http.MethodPost, "operations", record.SessionToken, requestPayload, &created); err != nil {
+		logSendFailure("create_onchain", requestID, 0, err)
 		return SendResult{}, fmt.Errorf("create outgoing operation: %w", err)
 	}
 	if created.Operation.ID == nil {
@@ -704,6 +706,7 @@ func (m *Manager) sendOnchain(ctx context.Context, request SendRequest, destinat
 	}
 	signed, err := signer(basePrivateKey, muunPublicKey, *created.PartiallySignedTransaction, nonces, expectations)
 	if err != nil {
+		logSendFailure("sign_onchain", requestID, *created.Operation.ID, err)
 		return SendResult{}, fmt.Errorf("sign outgoing transaction: %w", err)
 	}
 	if signed == nil || len(signed.Bytes) == 0 || signed.Hash == "" {
@@ -712,6 +715,7 @@ func (m *Manager) sendOnchain(ctx context.Context, request SendRequest, destinat
 
 	push := pushTransactionsRequest{RawTransaction: &rawTransactionPayload{Hex: hex.EncodeToString(signed.Bytes)}, AlternativeTransactions: []rawTransactionPayload{}}
 	if _, err := m.doJSON(ctx, http.MethodPut, "operations/"+strconv.FormatInt(*created.Operation.ID, 10)+"/raw-transactions", record.SessionToken, push, nil); err != nil {
+		logSendFailure("push_onchain", requestID, *created.Operation.ID, err)
 		return SendResult{}, fmt.Errorf("push outgoing transaction: %w", err)
 	}
 	return SendResult{OperationID: *created.Operation.ID, TransactionID: signed.Hash, AmountSatoshis: analysis.AmountInSat, FeeSatoshis: analysis.FeeTotalInSat}, nil
@@ -758,6 +762,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 		},
 		&remoteSwap,
 	); err != nil {
+		logSendFailure("create_lightning_swap", requestID, 0, err)
 		return SendResult{}, fmt.Errorf("create Lightning swap: %w", err)
 	}
 	swapFees, err := verifySubmarineSwap(invoice, remoteSwap, basePrivateKey.PublicKey(), muunPublicKey)
@@ -839,6 +844,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 	var created operationCreatedJSON
 	attempt.submitted = true
 	if _, err := m.doJSON(ctx, http.MethodPost, "operations", record.SessionToken, requestPayload, &created); err != nil {
+		logSendFailure("create_lightning", requestID, 0, err)
 		return SendResult{}, fmt.Errorf("create Lightning operation: %w", err)
 	}
 	if created.Operation.ID == nil {
@@ -875,6 +881,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 		}
 		signed, err := signer(basePrivateKey, muunPublicKey, *created.PartiallySignedTransaction, primaryNonces, expectations)
 		if err != nil {
+			logSendFailure("sign_lightning_funding", requestID, *created.Operation.ID, err)
 			return SendResult{}, fmt.Errorf("sign Lightning funding transaction: %w", err)
 		}
 		if signed == nil || len(signed.Bytes) == 0 || signed.Hash == "" {
@@ -889,6 +896,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 			}
 			signedAlternative, err := signer(basePrivateKey, muunPublicKey, alternative, alternativeNonces[index], expectations.ForAlternativeTransaction())
 			if err != nil {
+				logSendFailure("sign_lightning_alternative", requestID, *created.Operation.ID, err)
 				return SendResult{}, fmt.Errorf("sign Lightning alternative transaction %d: %w", index, err)
 			}
 			if signedAlternative == nil || len(signedAlternative.Bytes) == 0 {
@@ -906,6 +914,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 		push,
 		nil,
 	); err != nil {
+		logSendFailure("push_lightning", requestID, *created.Operation.ID, err)
 		return SendResult{}, fmt.Errorf("push Lightning transaction: %w", err)
 	}
 
@@ -916,6 +925,16 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 		FeeSatoshis:    analysis.FeeTotalInSat,
 		PaymentHash:    hex.EncodeToString(invoice.PaymentHash),
 	}, nil
+}
+
+// Do not log err.Error(): Houston error bodies may contain payment or wallet data.
+func logSendFailure(phase, requestID string, operationID int64, err error) {
+	var remote *HoustonError
+	houstonStatus := 0
+	if errors.As(err, &remote) {
+		houstonStatus = remote.StatusCode
+	}
+	log.Printf("send_failed phase=%s request_id=%s operation_id=%d error_type=%T houston_status=%d", phase, requestID, operationID, err, houstonStatus)
 }
 
 func verifySubmarineSwap(

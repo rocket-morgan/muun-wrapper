@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -319,25 +320,30 @@ func sendKeyFromPath(request *http.Request, prefix string) (string, bool) {
 
 func writeSendError(writer http.ResponseWriter, err error) {
 	if errors.Is(err, wallet.ErrSendInProgress) {
-		writeCodedError(writer, http.StatusConflict, err.Error(), "send_in_progress")
+		writeSendCodedError(writer, http.StatusConflict, err, "send_in_progress")
 		return
 	}
 	if errors.Is(err, wallet.ErrIdempotencyKeyReused) {
-		writeCodedError(writer, http.StatusUnprocessableEntity, err.Error(), "idempotency_key_reused")
+		writeSendCodedError(writer, http.StatusUnprocessableEntity, err, "idempotency_key_reused")
 		return
 	}
 	var sendError *wallet.SendError
 	if errors.As(err, &sendError) {
 		if sendError.Submitted {
-			writeCodedError(writer, http.StatusBadGateway, sendError.Error(), "submit_failed")
+			writeSendCodedError(writer, http.StatusBadGateway, err, "submit_failed")
 			return
 		}
 		if wallet.IsHoustonSessionError(sendError) {
-			writeCodedError(writer, http.StatusServiceUnavailable, sendError.Error(), "houston_session")
+			writeSendCodedError(writer, http.StatusServiceUnavailable, err, "houston_session")
 			return
 		}
 	}
-	writeCodedError(writer, http.StatusBadRequest, err.Error(), "validation")
+	writeSendCodedError(writer, http.StatusBadRequest, err, "validation")
+}
+
+func writeSendCodedError(writer http.ResponseWriter, status int, err error, code string) {
+	log.Printf("send_rejected code=%s status=%d error_type=%T", code, status, err)
+	writeCodedError(writer, status, err.Error(), code)
 }
 
 func writeCodedError(writer http.ResponseWriter, status int, message, code string) {

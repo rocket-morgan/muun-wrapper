@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -65,6 +66,29 @@ func TestSendOnchainRejectsTamperedChangeBeforePush(t *testing.T) {
 				t.Fatalf("created operation must remain ambiguous: status=%+v err=%v", status, err)
 			}
 		})
+	}
+}
+
+func TestSendSignatureFailureLogsOnlyPhaseAndIdentifiers(t *testing.T) {
+	var captured bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&captured)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	manager, destination, pushes := signingOnchainManager(t, 8650, []int64{1017133}, 8109)
+	_, err := manager.Send(context.Background(), SendRequest{Destination: destination, AmountSatoshis: 1000000, IdempotencyKey: "private-logging-key"})
+	if err == nil || *pushes != 0 {
+		t.Fatalf("expected rejected signature without a push: error=%v pushes=%d", err, *pushes)
+	}
+	text := captured.String()
+	for _, want := range []string{"phase=sign_onchain", "request_id=" + requestIDForIdempotencyKey("private-logging-key"), "operation_id=91", "error_type="} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in safe failure log %q", want, text)
+		}
+	}
+	for _, secret := range []string{destination, "private-logging-key", "synthetic-session", "synthetic passphrase", err.Error()} {
+		if strings.Contains(text, secret) {
+			t.Error("failure log contains raw error or private payment data")
+		}
 	}
 }
 
