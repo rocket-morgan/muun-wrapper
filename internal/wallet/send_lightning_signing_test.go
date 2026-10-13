@@ -3,13 +3,57 @@ package wallet
 import (
 	"bytes"
 	"context"
-	libwallet "github.com/muun/libwallet"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	libwallet "github.com/muun/libwallet"
 )
+
+func TestLightningAlternativeVerificationRequiresReducedDestination(t *testing.T) {
+	user := mustTestBaseKey(t, bytes.Repeat([]byte{83}, 32))
+	muun := mustTestBaseKey(t, bytes.Repeat([]byte{84}, 32))
+	receiver := mustTestBaseKey(t, bytes.Repeat([]byte{85}, 32))
+	destination, err := libwallet.CreateAddressV1(receiver.PublicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := syntheticWalletAddress(t, user.PublicKey(), muun.PublicKey(), basePath+"/change:0/1")
+	for _, test := range []struct {
+		name       string
+		funding    int64
+		actual     int64
+		omit       bool
+		wantReject bool
+	}{
+		{"minimum_equal", 546, 546, false, true},
+		{"minimum_reduced", 546, 545, false, false},
+		{"destination_omitted", 546, 0, true, false},
+		{"larger_payment_reduced", 1005, 900, false, false},
+		{"larger_payment_equal", 1005, 1005, false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			to := destination.Address()
+			if test.omit {
+				to = ""
+			}
+			partial := syntheticPartial(t, user.PublicKey(), []int64{10000}, to, test.actual, change.Address, 10000-test.funding-29)
+			expectations := libwallet.NewSigningExpectations(destination.Address(), test.funding, walletAddress{
+				version: change.Version, derivationPath: change.DerivationPath, address: change.Address,
+			}, 29, true)
+			_, err := signPartiallySignedTransaction(user, muun.PublicKey(), partial, libwallet.GenerateMusigNonces(1), expectations)
+			if test.wantReject {
+				if err == nil || !strings.Contains(err.Error(), "destination amount is mismatched") {
+					t.Fatalf("expected strict Apollo alternative rejection, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func TestLightningSwapCreationFailureLogsCorrelatedSafeMetadata(t *testing.T) {
 	var captured bytes.Buffer
