@@ -699,8 +699,7 @@ func (m *Manager) sendOnchain(ctx context.Context, request SendRequest, destinat
 	if created.ChangeAddress != nil {
 		change = walletAddress{version: created.ChangeAddress.Version, derivationPath: created.ChangeAddress.DerivationPath, address: created.ChangeAddress.Address}
 	}
-	// Expected debt limits spendable balance, but is not an additional transaction
-	// fee. Match Apollo's signing contract using the operation's actual fee.
+	// Debt limits spendable balance, not the signing fee (docs/2026-10-13-payment-signing-repair.md).
 	expectations := libwallet.NewSigningExpectations(destination, analysis.AmountInSat, change, analysis.FeeTotalInSat, false)
 	signer := m.signOutgoingTransaction
 	if signer == nil {
@@ -898,14 +897,8 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 			}
 			signedAlternative, err := signer(basePrivateKey, muunPublicKey, alternative, alternativeNonces[index], expectations.ForAlternativeTransaction())
 			if errors.Is(err, errTransactionVerification) && *remoteSwap.FundingOutputData.OutputAmountInSatoshis <= operation.DustThreshold {
-				// Houston pads sub-dust swaps to the dust floor and still asks for
-				// alternatives, which cannot pay the destination any less. Falcon 2.16.0's
-				// libwallet accepts that equal destination (verifyDestinationOutput, test
-				// "alternative at the dust floor pays exactly the approved amount"); this
-				// wrapper identifies as FALCON 2.16.0 but links Apollo's stricter
-				// libwallet. Unlike Falcon, change and fee stay enforced: the alternative
-				// must pass the principal's strict check. Verify failed before Sign used
-				// these nonces.
+				// Dust floor: an alternative cannot pay less, so it must pass the principal's strict
+				// check (Falcon 2.16.0 precedent, see docs/2026-10-13-payment-signing-repair.md).
 				var strictErr error
 				signedAlternative, strictErr = signer(basePrivateKey, muunPublicKey, alternative, alternativeNonces[index], expectations)
 				phase := "sign_lightning_alternative_fallback"

@@ -83,8 +83,7 @@ func TestSendLightningNegotiatesAlternativesWithRealSigner(t *testing.T) {
 		mutation, wantError  string
 		wantLog              string
 	}{
-		// Houston pads sub-dust swaps to a 546 sat funding output and still asks
-		// for alternatives, which repeat the principal's outputs and fee.
+		// Sub-dust swaps are padded to a 546 sat funding output; Houston's alternatives repeat the principal.
 		{name: "ramp_on_93", amount: 93, funding: 546, advertised: 1, wantAlts: 1, wantLog: identicalAlternativeLog},
 		{name: "probe_100", amount: 100, funding: 546, advertised: 2, wantAlts: 2, wantLog: identicalAlternativeLog},
 		{name: "ramp_on_228", amount: 228, funding: 546, advertised: 1, wantAlts: 1, wantLog: identicalAlternativeLog},
