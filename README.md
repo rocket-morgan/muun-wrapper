@@ -182,6 +182,9 @@ la imagen.
 El saldo se consulta desde la progresión de UTXOs de Houston. `POST /send` acepta direcciones
 onchain y invoices Lightning con monto fijo. Las invoices sin monto quedan fuera de esta fase.
 
+Una transacción alternativa Lightning debe pagar al swap menos que la transacción principal. En el
+piso de dust (546 sats) puede pagar lo mismo si supera la verificación estricta de la principal.
+
 ## Documentación de referencia
 
 La especificación de la API REST, compatible con Swagger UI y otras herramientas OpenAPI, está en

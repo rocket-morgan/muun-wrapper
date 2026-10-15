@@ -16,9 +16,11 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/google/uuid"
 	libwallet "github.com/muun/libwallet"
 	"github.com/muun/libwallet/btcsuitew/btcutilw"
+	"github.com/muun/libwallet/btcsuitew/txscriptw"
 	"github.com/muun/libwallet/fees"
 	"github.com/muun/libwallet/operation"
 )
@@ -895,6 +897,25 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 				return SendResult{}, errors.New("Houston returned an alternative transaction without matching nonces")
 			}
 			signedAlternative, err := signer(basePrivateKey, muunPublicKey, alternative, alternativeNonces[index], expectations.ForAlternativeTransaction())
+			if errors.Is(err, errTransactionVerification) && *remoteSwap.FundingOutputData.OutputAmountInSatoshis <= operation.DustThreshold {
+				// Houston pads sub-dust swaps to the dust floor and still asks for
+				// alternatives, which cannot pay the destination any less. Falcon 2.16.0's
+				// libwallet accepts that equal destination (verifyDestinationOutput, test
+				// "alternative at the dust floor pays exactly the approved amount"); this
+				// wrapper identifies as FALCON 2.16.0 but links Apollo's stricter
+				// libwallet. Unlike Falcon, change and fee stay enforced: the alternative
+				// must pass the principal's strict check. Verify failed before Sign used
+				// these nonces.
+				var strictErr error
+				signedAlternative, strictErr = signer(basePrivateKey, muunPublicKey, alternative, alternativeNonces[index], expectations)
+				phase := "sign_lightning_alternative_fallback"
+				if errors.Is(strictErr, errTransactionVerification) {
+					phase, strictErr = "sign_lightning_alternative_rejected", errors.Join(err, strictErr)
+				}
+				logAlternativeCheck(phase, requestID, *created.Operation.ID, index, alternative,
+					remoteSwap.FundingOutputData.OutputAddress, *remoteSwap.FundingOutputData.OutputAmountInSatoshis, change, analysis.FeeTotalInSat)
+				err = strictErr
+			}
 			if err != nil {
 				logSendFailure("sign_lightning_alternative", requestID, *created.Operation.ID, err)
 				return SendResult{}, fmt.Errorf("sign Lightning alternative transaction %d: %w", index, err)
@@ -935,6 +956,53 @@ func logSendFailure(phase, requestID string, operationID int64, err error) {
 		houstonStatus = remote.StatusCode
 	}
 	log.Printf("send_failed phase=%s request_id=%s operation_id=%d error_type=%T houston_status=%d", phase, requestID, operationID, err, houstonStatus)
+}
+
+// logAlternativeCheck compares an alternative with the principal's signing contract using
+// counts and satoshi deltas only: never addresses, scripts, amounts, hashes or hex. Data it
+// cannot decode is logged as zeros; logging never fails the send.
+func logAlternativeCheck(phase, requestID string, operationID int64, index int, partial partiallySignedTransactionJSON, destination string, amount int64, change libwallet.MuunAddress, fee int64) {
+	var outputs int
+	var destinationDelta, changeDelta, feeDelta int64
+	destinationScript, changeScript := outputScript(destination), []byte(nil)
+	if change != nil {
+		changeScript = outputScript(change.Address())
+	}
+	raw, err := hex.DecodeString(partial.HexTransaction)
+	tx := wire.NewMsgTx(0)
+	if err == nil && tx.Deserialize(bytes.NewReader(raw)) == nil && destinationScript != nil && (change == nil || changeScript != nil) {
+		var inputs, paid, toDestination, toChange int64
+		for _, input := range partial.Inputs {
+			inputs += input.PrevOut.Amount
+		}
+		for _, output := range tx.TxOut {
+			paid += output.Value
+			if bytes.Equal(output.PkScript, destinationScript) {
+				toDestination += output.Value
+			} else if changeScript != nil && bytes.Equal(output.PkScript, changeScript) {
+				toChange += output.Value
+			}
+		}
+		outputs, destinationDelta, changeDelta, feeDelta = len(tx.TxOut), toDestination-amount, toChange, inputs-paid-fee
+		if change != nil {
+			changeDelta -= inputs - amount - fee
+		}
+	}
+	log.Printf("send_alternative_check phase=%s request_id=%s operation_id=%d index=%d outputs=%d destination_delta=%d change_delta=%d fee_delta=%d",
+		phase, requestID, operationID, index, outputs, destinationDelta, changeDelta, feeDelta)
+}
+
+// outputScript derives an output script the same way libwallet's Verify does, or nil.
+func outputScript(address string) []byte {
+	decoded, err := btcutilw.DecodeAddress(address, &chaincfg.MainNetParams)
+	if err != nil {
+		return nil
+	}
+	script, err := txscriptw.PayToAddrScript(decoded)
+	if err != nil {
+		return nil
+	}
+	return script
 }
 
 func verifySubmarineSwap(
@@ -1307,6 +1375,10 @@ func musigPublicNonces(nonces *libwallet.MusigNonces) []string {
 	return values
 }
 
+// errTransactionVerification marks a libwallet Verify rejection. Verify runs before Sign, so
+// such a failure leaves the MuSig nonces unused.
+var errTransactionVerification = errors.New("verify partially signed transaction")
+
 func signPartiallySignedTransaction(
 	basePrivateKey *libwallet.HDPrivateKey,
 	muunPublicKey *libwallet.HDPublicKey,
@@ -1337,7 +1409,7 @@ func signPartiallySignedTransaction(
 		return nil, fmt.Errorf("build partially signed transaction: %w", err)
 	}
 	if err := transaction.Verify(expectations, basePrivateKey.PublicKey(), muunPublicKey); err != nil {
-		return nil, fmt.Errorf("verify partially signed transaction: %w", err)
+		return nil, fmt.Errorf("%w: %w", errTransactionVerification, err)
 	}
 	signed, err := transaction.Sign(basePrivateKey, muunPublicKey)
 	if err != nil {
