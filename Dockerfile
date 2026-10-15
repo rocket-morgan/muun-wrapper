@@ -1,27 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.84 AS librs-builder
+# Apollo base image tag printed by scripts/apollo-image.sh (see Dockerfile.apollo).
+ARG APOLLO_IMAGE
 
-ARG APOLLO_COMMIT=e5f5e1bb54f611ef457c56207f2a34ac85b00827
-ARG RUSTUP_TOOLCHAIN=nightly-2024-12-16
-ARG LIBRS_TARGET=x86_64-unknown-linux-musl
-
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates git \
-    && rm -rf /var/lib/apt/lists/* \
-    && git clone https://github.com/muun/apollo.git /deps/apollo \
-    && git -C /deps/apollo checkout --detach "$APOLLO_COMMIT" \
-    && rustup toolchain install "$RUSTUP_TOOLCHAIN" \
-    && rustup override set "$RUSTUP_TOOLCHAIN" \
-    && rustup target add --toolchain "$RUSTUP_TOOLCHAIN" "$LIBRS_TARGET"
-
-WORKDIR /deps/apollo
-
-RUN TARGETS="$LIBRS_TARGET" USE_HOST_CARGO=true libwallet/librs/makelibs.sh
+FROM ${APOLLO_IMAGE} AS apollo
 
 FROM golang:1.24-bookworm AS builder
 
-COPY --from=librs-builder /deps/apollo /deps/apollo
+COPY --from=apollo /deps/apollo/libwallet /deps/apollo/libwallet
 
 WORKDIR /src
 COPY . .

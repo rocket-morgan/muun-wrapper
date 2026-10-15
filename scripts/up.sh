@@ -9,6 +9,8 @@ if [[ ! -f compose.secrets ]]; then
   exit 1
 fi
 
+APOLLO_IMAGE="$(./scripts/apollo-image.sh)"
+export APOLLO_IMAGE
 docker compose up --build -d "$@"
 
 for _ in {1..20}; do
