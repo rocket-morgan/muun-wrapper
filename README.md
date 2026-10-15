@@ -89,8 +89,9 @@ emitió esta wallet: un payment hash desconocido devuelve `404` en vez de un "no
 indefinido. El campo `state` vale `pending` (sin pago reportado), `receiving` (el pago llegó pero
 su incoming swap no está liquidado, así que no hay preimage y los fondos no son gastables) o
 `settled` (el preimage prueba el pago). Es idempotente: no dispara sincronización. `GET /operations`
-incluye `paymentHash` y `preimage` en los incoming swaps, para correlacionar operaciones con
-invoices.
+y `GET /operations/{id}` incluyen `paymentHash` en los swaps Lightning, entrantes y salientes (en un
+swap saliente es el hash de la invoice pagada), y `preimage` sólo en los incoming swaps, para
+correlacionar operaciones con invoices.
 `POST /sync` busca incoming swaps pendientes en la historia de Houston y los liquida; ejecutalo
 después de pagar una invoice si no querés esperar al poller. El servidor también sincroniza al
 iniciar y cada `MUUN_WRAPPER_SYNC_INTERVAL` (20 segundos por defecto). `POST /send` recibe una dirección Bitcoin o una invoice Lightning BOLT11 con monto fijo, más
