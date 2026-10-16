@@ -179,11 +179,12 @@ make build
 
 Apollo no se descarga ni se compila en cada build. `Dockerfile.apollo` define una imagen local,
 `muun-wrapper-apollo`, que descarga sólo el commit fijado (`git fetch --depth 1` con sparse
-checkout de `libwallet` y `prover`), compila `librs` para Linux y conserva únicamente
-`/deps/apollo/libwallet`. Sus labels `apollo.commit`, `apollo.rust-toolchain` y
-`apollo.librs-target` identifican el contenido. `Dockerfile` y `Dockerfile.test` copian ese
-directorio y aplican un `replace` temporal hacia `/deps/apollo/libwallet`; no usan git ni Rust y
-no dependen de una copia local de Apollo.
+checkout de `libwallet`) y conserva únicamente las fuentes Go de `/deps/apollo/libwallet`. El label
+`apollo.commit` identifica el contenido. No compila `librs` (Rust): el wrapper no importa
+`github.com/muun/libwallet/librs`, así que nada enlaza su biblioteca estática. Por eso cualquier
+host, incluso uno de 1 vCPU y 3 GB de RAM, puede construirla con `./scripts/apollo-image.sh`.
+`Dockerfile` y `Dockerfile.test` copian ese directorio y aplican un `replace` temporal hacia
+`/deps/apollo/libwallet`; no usan git y no dependen de una copia local de Apollo.
 
 `scripts/apollo-image.sh` imprime el tag de la imagen, formado por los primeros 12 caracteres del
 commit y los primeros 8 del SHA-256 de `Dockerfile.apollo`, y la construye sólo si ese tag no
@@ -203,8 +204,9 @@ Para actualizar Apollo:
 3. Eliminar la imagen anterior cuando ya no se use: `docker image rm muun-wrapper-apollo:<tag>`.
 
 `docker image prune -a` también elimina la imagen base, porque ningún contenedor la usa; el build
-siguiente la vuelve a crear. Un host con poco disco puede recibirla ya construida: el tag depende
-sólo de `Dockerfile.apollo`, así que coincide entre copias del repositorio con la misma receta.
+siguiente la vuelve a crear. Un host sin acceso a GitHub puede recibirla ya construida: el tag
+depende sólo de `Dockerfile.apollo`, así que coincide entre copias del repositorio con la misma
+receta.
 
 ```bash
 # En la máquina que construyó la imagen:
@@ -213,10 +215,6 @@ docker save "$(./scripts/apollo-image.sh)" | gzip > apollo-base.tar.gz
 gunzip -c apollo-base.tar.gz | docker load
 ./scripts/apollo-image.sh   # imprime el mismo tag sin construir
 ```
-
-Una vez creada la imagen base, los builds siguientes ya no necesitan la imagen `rust:1.84` ni la
-caché de build de Rust. `docker builder prune -a` libera ese espacio; también borra la caché de
-módulos Go y las imágenes base del resto de los stages, que el build siguiente vuelve a descargar.
 
 ## Estado de las operaciones
 
