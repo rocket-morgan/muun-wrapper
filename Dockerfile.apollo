@@ -1,47 +1,31 @@
-# Apollo base image: libwallet at the pinned commit with librs prebuilt.
+# Apollo base image: libwallet Go sources at the pinned commit.
 # scripts/apollo-image.sh builds it once per pin and recipe; Dockerfile and
 # Dockerfile.test copy /deps/apollo/libwallet from it.
+#
+# librs (Rust) is not built: the wrapper never imports
+# github.com/muun/libwallet/librs, so nothing links its static library.
 
 ARG APOLLO_COMMIT=e5f5e1bb54f611ef457c56207f2a34ac85b00827
-ARG RUSTUP_TOOLCHAIN=nightly-2024-12-16
-ARG LIBRS_TARGET=x86_64-unknown-linux-musl
 
-FROM rust:1.84 AS librs
-
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates git \
-    && rm -rf /var/lib/apt/lists/*
-
-ARG RUSTUP_TOOLCHAIN
-ARG LIBRS_TARGET
-RUN rustup toolchain install "$RUSTUP_TOOLCHAIN" \
-    && rustup override set "$RUSTUP_TOOLCHAIN" \
-    && rustup target add --toolchain "$RUSTUP_TOOLCHAIN" "$LIBRS_TARGET"
+# Same image as the Go build stages, so the fetch reuses it and its git.
+FROM golang:1.24-bookworm AS libwallet
 
 WORKDIR /deps/apollo
 
-# Only the pinned commit, and only libwallet plus the prover crates librs
-# depends on. makelibs.sh needs a git work tree.
+# Only the pinned commit, and only libwallet.
 ARG APOLLO_COMMIT
 RUN git init --quiet \
     && git remote add origin https://github.com/muun/apollo.git \
-    && git sparse-checkout set --cone libwallet prover \
+    && git sparse-checkout set --cone libwallet \
     && git fetch --depth 1 --filter=blob:none origin "$APOLLO_COMMIT" \
     && git checkout --quiet --detach FETCH_HEAD \
     && fetched="$(git rev-parse HEAD)" \
     && if [ "$fetched" != "$APOLLO_COMMIT" ]; then echo "fetched $fetched, expected $APOLLO_COMMIT" >&2; exit 1; fi \
     && echo "apollo $fetched: $(git rev-list --count HEAD) commit(s), .git $(du -sh .git | cut -f1)"
 
-RUN TARGETS="$LIBRS_TARGET" USE_HOST_CARGO=true libwallet/librs/makelibs.sh \
-    && rm -rf libwallet/librs/target
-
 FROM scratch
 
 ARG APOLLO_COMMIT
-ARG RUSTUP_TOOLCHAIN
-ARG LIBRS_TARGET
-LABEL apollo.commit="$APOLLO_COMMIT" \
-      apollo.rust-toolchain="$RUSTUP_TOOLCHAIN" \
-      apollo.librs-target="$LIBRS_TARGET"
+LABEL apollo.commit="$APOLLO_COMMIT"
 
-COPY --from=librs /deps/apollo/libwallet /deps/apollo/libwallet
+COPY --from=libwallet /deps/apollo/libwallet /deps/apollo/libwallet
