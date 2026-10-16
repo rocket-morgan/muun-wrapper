@@ -885,7 +885,7 @@
           "paymentHash": {
             "type": "string",
             "pattern": "^[0-9a-fA-F]{64}$",
-            "description": "Sólo en incoming swaps Lightning. Correlaciona la operación con su invoice."
+            "description": "Presente en los swaps Lightning, entrantes y salientes. Correlaciona la operación con su invoice: en un swap saliente es el hash de la invoice pagada, el mismo paymentHash de POST /send. Las operaciones onchain no lo incluyen."
           },
           "preimage": {
             "type": "string",

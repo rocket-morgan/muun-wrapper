@@ -11,9 +11,8 @@ import (
 	libwallet "github.com/muun/libwallet"
 )
 
-// Houston settles any outstanding lending-swap debt out of the change output of the next on-chain
-// payment, so the amount it withholds is the network fee plus that debt.
-func TestSendOnchainAddsDebtToSigningExpectations(t *testing.T) {
+// Debt affects affordability, not the transaction fee supplied to Apollo's signer.
+func TestSendOnchainUsesOperationFeeInSigningExpectations(t *testing.T) {
 	const expectedDebt = 2_354
 
 	muunKey := mustTestBaseKey(t, bytes.Repeat([]byte{51}, 32))
@@ -129,10 +128,29 @@ func TestSendOnchainAddsDebtToSigningExpectations(t *testing.T) {
 		receiverAddress.Address(),
 		result.AmountSatoshis,
 		nil,
-		result.FeeSatoshis+expectedDebt,
+		result.FeeSatoshis,
 		false,
 	)
 	if !reflect.DeepEqual(signedWith, want) {
 		t.Fatalf("signing expectations = %+v, want %+v", signedWith, want)
+	}
+}
+
+func TestOnchainExpectedDebtStillLimitsSpendableCapacity(t *testing.T) {
+	realtime := realtimeData{
+		FeeWindow:          &feeWindow{FastConfTarget: 1, TargetedFees: map[string]float64{"1": 5}},
+		ExchangeRateWindow: &exchangeRateWindow{ID: 1, Rates: map[string]float64{"BTC": 1}},
+	}
+	next := nextTransactionSize{SizeProgression: []sizeForAmount{{
+		AmountInSatoshis: 20000, SizeInBytes: 400,
+		Outpoint: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd:0", Status: "CONFIRMED",
+	}}}
+	if _, _, err := analyzeOnchainPayment(11000, realtime, next); err != nil {
+		t.Fatalf("payment is affordable without debt: %v", err)
+	}
+	debt := int64(8650)
+	next.ExpectedDebtInSat = &debt
+	if _, _, err := analyzeOnchainPayment(11000, realtime, next); err == nil {
+		t.Fatal("payment plus 500-sat fee exceeds 11350 spendable sats after debt")
 	}
 }

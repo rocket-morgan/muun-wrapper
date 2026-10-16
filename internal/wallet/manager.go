@@ -112,8 +112,9 @@ type Operation struct {
 	Confirmations   int64   `json:"confirmations"`
 	TransactionID   *string `json:"transactionId"`
 	ReceiverAddress string  `json:"receiverAddress,omitempty"`
-	// PaymentHash and Preimage are only present on incoming Lightning swaps. A non-empty Preimage
-	// proves the payment settled.
+	// PaymentHash is present on Lightning swaps: the invoice hash of an incoming swap or of the
+	// invoice an outgoing swap paid. Preimage is only present on incoming swaps, and a non-empty
+	// Preimage proves the payment settled.
 	PaymentHash string `json:"paymentHash,omitempty"`
 	Preimage    string `json:"preimage,omitempty"`
 }
@@ -923,6 +924,8 @@ func mapOperation(remote operationJSON) (Operation, error) {
 	if remote.IncomingSwap != nil {
 		operation.PaymentHash = remote.IncomingSwap.PaymentHashHex
 		operation.Preimage = remote.IncomingSwap.PreimageHex
+	} else {
+		operation.PaymentHash = outgoingSwapPaymentHash(remote)
 	}
 	return operation, nil
 }

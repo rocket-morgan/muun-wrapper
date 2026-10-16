@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"strconv"
@@ -15,9 +16,11 @@ import (
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/google/uuid"
 	libwallet "github.com/muun/libwallet"
 	"github.com/muun/libwallet/btcsuitew/btcutilw"
+	"github.com/muun/libwallet/btcsuitew/txscriptw"
 	"github.com/muun/libwallet/fees"
 	"github.com/muun/libwallet/operation"
 )
@@ -522,7 +525,7 @@ func (m *Manager) PreviewSend(ctx context.Context, request SendPreviewRequest) (
 		if err != nil {
 			return SendPreview{}, err
 		}
-		analysis, _, _, err := analyzeOnchainPayment(request.AmountSatoshis, realtime, nextSize)
+		analysis, _, err := analyzeOnchainPayment(request.AmountSatoshis, realtime, nextSize)
 		if err != nil {
 			return SendPreview{}, err
 		}
@@ -645,7 +648,7 @@ func (m *Manager) sendOnchain(ctx context.Context, request SendRequest, destinat
 	if err != nil {
 		return SendResult{}, err
 	}
-	analysis, outpoints, expectedDebt, err := analyzeOnchainPayment(request.AmountSatoshis, realtime, nextSize)
+	analysis, outpoints, err := analyzeOnchainPayment(request.AmountSatoshis, realtime, nextSize)
 	if err != nil {
 		return SendResult{}, err
 	}
@@ -679,6 +682,7 @@ func (m *Manager) sendOnchain(ctx context.Context, request SendRequest, destinat
 	var created operationCreatedJSON
 	attempt.submitted = true
 	if _, err := m.doJSON(ctx, http.MethodPost, "operations", record.SessionToken, requestPayload, &created); err != nil {
+		logSendFailure("create_onchain", requestID, 0, err)
 		return SendResult{}, fmt.Errorf("create outgoing operation: %w", err)
 	}
 	if created.Operation.ID == nil {
@@ -695,13 +699,15 @@ func (m *Manager) sendOnchain(ctx context.Context, request SendRequest, destinat
 	if created.ChangeAddress != nil {
 		change = walletAddress{version: created.ChangeAddress.Version, derivationPath: created.ChangeAddress.DerivationPath, address: created.ChangeAddress.Address}
 	}
-	expectations := libwallet.NewSigningExpectations(destination, analysis.AmountInSat, change, analysis.FeeTotalInSat+expectedDebt, false)
+	// Debt limits spendable balance, not the signing fee (docs/2026-10-13-payment-signing-repair.md).
+	expectations := libwallet.NewSigningExpectations(destination, analysis.AmountInSat, change, analysis.FeeTotalInSat, false)
 	signer := m.signOutgoingTransaction
 	if signer == nil {
 		signer = signPartiallySignedTransaction
 	}
 	signed, err := signer(basePrivateKey, muunPublicKey, *created.PartiallySignedTransaction, nonces, expectations)
 	if err != nil {
+		logSendFailure("sign_onchain", requestID, *created.Operation.ID, err)
 		return SendResult{}, fmt.Errorf("sign outgoing transaction: %w", err)
 	}
 	if signed == nil || len(signed.Bytes) == 0 || signed.Hash == "" {
@@ -710,6 +716,7 @@ func (m *Manager) sendOnchain(ctx context.Context, request SendRequest, destinat
 
 	push := pushTransactionsRequest{RawTransaction: &rawTransactionPayload{Hex: hex.EncodeToString(signed.Bytes)}, AlternativeTransactions: []rawTransactionPayload{}}
 	if _, err := m.doJSON(ctx, http.MethodPut, "operations/"+strconv.FormatInt(*created.Operation.ID, 10)+"/raw-transactions", record.SessionToken, push, nil); err != nil {
+		logSendFailure("push_onchain", requestID, *created.Operation.ID, err)
 		return SendResult{}, fmt.Errorf("push outgoing transaction: %w", err)
 	}
 	return SendResult{OperationID: *created.Operation.ID, TransactionID: signed.Hash, AmountSatoshis: analysis.AmountInSat, FeeSatoshis: analysis.FeeTotalInSat}, nil
@@ -756,6 +763,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 		},
 		&remoteSwap,
 	); err != nil {
+		logSendFailure("create_lightning_swap", requestID, 0, err)
 		return SendResult{}, fmt.Errorf("create Lightning swap: %w", err)
 	}
 	swapFees, err := verifySubmarineSwap(invoice, remoteSwap, basePrivateKey.PublicKey(), muunPublicKey)
@@ -837,6 +845,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 	var created operationCreatedJSON
 	attempt.submitted = true
 	if _, err := m.doJSON(ctx, http.MethodPost, "operations", record.SessionToken, requestPayload, &created); err != nil {
+		logSendFailure("create_lightning", requestID, 0, err)
 		return SendResult{}, fmt.Errorf("create Lightning operation: %w", err)
 	}
 	if created.Operation.ID == nil {
@@ -873,6 +882,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 		}
 		signed, err := signer(basePrivateKey, muunPublicKey, *created.PartiallySignedTransaction, primaryNonces, expectations)
 		if err != nil {
+			logSendFailure("sign_lightning_funding", requestID, *created.Operation.ID, err)
 			return SendResult{}, fmt.Errorf("sign Lightning funding transaction: %w", err)
 		}
 		if signed == nil || len(signed.Bytes) == 0 || signed.Hash == "" {
@@ -886,7 +896,21 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 				return SendResult{}, errors.New("Houston returned an alternative transaction without matching nonces")
 			}
 			signedAlternative, err := signer(basePrivateKey, muunPublicKey, alternative, alternativeNonces[index], expectations.ForAlternativeTransaction())
+			if errors.Is(err, errTransactionVerification) && *remoteSwap.FundingOutputData.OutputAmountInSatoshis <= operation.DustThreshold {
+				// Dust floor: an alternative cannot pay less, so it must pass the principal's strict
+				// check (Falcon 2.16.0 precedent, see docs/2026-10-13-payment-signing-repair.md).
+				var strictErr error
+				signedAlternative, strictErr = signer(basePrivateKey, muunPublicKey, alternative, alternativeNonces[index], expectations)
+				phase := "sign_lightning_alternative_fallback"
+				if errors.Is(strictErr, errTransactionVerification) {
+					phase, strictErr = "sign_lightning_alternative_rejected", errors.Join(err, strictErr)
+				}
+				logAlternativeCheck(phase, requestID, *created.Operation.ID, index, alternative,
+					remoteSwap.FundingOutputData.OutputAddress, *remoteSwap.FundingOutputData.OutputAmountInSatoshis, change, analysis.FeeTotalInSat)
+				err = strictErr
+			}
 			if err != nil {
+				logSendFailure("sign_lightning_alternative", requestID, *created.Operation.ID, err)
 				return SendResult{}, fmt.Errorf("sign Lightning alternative transaction %d: %w", index, err)
 			}
 			if signedAlternative == nil || len(signedAlternative.Bytes) == 0 {
@@ -904,6 +928,7 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 		push,
 		nil,
 	); err != nil {
+		logSendFailure("push_lightning", requestID, *created.Operation.ID, err)
 		return SendResult{}, fmt.Errorf("push Lightning transaction: %w", err)
 	}
 
@@ -914,6 +939,63 @@ func (m *Manager) sendLightning(ctx context.Context, request SendRequest, invoic
 		FeeSatoshis:    analysis.FeeTotalInSat,
 		PaymentHash:    hex.EncodeToString(invoice.PaymentHash),
 	}, nil
+}
+
+// Do not log err.Error(): Houston error bodies may contain payment or wallet data.
+func logSendFailure(phase, requestID string, operationID int64, err error) {
+	var remote *HoustonError
+	houstonStatus := 0
+	if errors.As(err, &remote) {
+		houstonStatus = remote.StatusCode
+	}
+	log.Printf("send_failed phase=%s request_id=%s operation_id=%d error_type=%T houston_status=%d", phase, requestID, operationID, err, houstonStatus)
+}
+
+// logAlternativeCheck compares an alternative with the principal's signing contract using
+// counts and satoshi deltas only: never addresses, scripts, amounts, hashes or hex. Data it
+// cannot decode is logged as zeros; logging never fails the send.
+func logAlternativeCheck(phase, requestID string, operationID int64, index int, partial partiallySignedTransactionJSON, destination string, amount int64, change libwallet.MuunAddress, fee int64) {
+	var outputs int
+	var destinationDelta, changeDelta, feeDelta int64
+	destinationScript, changeScript := outputScript(destination), []byte(nil)
+	if change != nil {
+		changeScript = outputScript(change.Address())
+	}
+	raw, err := hex.DecodeString(partial.HexTransaction)
+	tx := wire.NewMsgTx(0)
+	if err == nil && tx.Deserialize(bytes.NewReader(raw)) == nil && destinationScript != nil && (change == nil || changeScript != nil) {
+		var inputs, paid, toDestination, toChange int64
+		for _, input := range partial.Inputs {
+			inputs += input.PrevOut.Amount
+		}
+		for _, output := range tx.TxOut {
+			paid += output.Value
+			if bytes.Equal(output.PkScript, destinationScript) {
+				toDestination += output.Value
+			} else if changeScript != nil && bytes.Equal(output.PkScript, changeScript) {
+				toChange += output.Value
+			}
+		}
+		outputs, destinationDelta, changeDelta, feeDelta = len(tx.TxOut), toDestination-amount, toChange, inputs-paid-fee
+		if change != nil {
+			changeDelta -= inputs - amount - fee
+		}
+	}
+	log.Printf("send_alternative_check phase=%s request_id=%s operation_id=%d index=%d outputs=%d destination_delta=%d change_delta=%d fee_delta=%d",
+		phase, requestID, operationID, index, outputs, destinationDelta, changeDelta, feeDelta)
+}
+
+// outputScript derives an output script the same way libwallet's Verify does, or nil.
+func outputScript(address string) []byte {
+	decoded, err := btcutilw.DecodeAddress(address, &chaincfg.MainNetParams)
+	if err != nil {
+		return nil
+	}
+	script, err := txscriptw.PayToAddrScript(decoded)
+	if err != nil {
+		return nil
+	}
+	return script
 }
 
 func verifySubmarineSwap(
@@ -1123,36 +1205,36 @@ func (m *Manager) fetchNextTransactionSize(ctx context.Context, token string) (n
 	return nextSize, nil
 }
 
-// analyzeOnchainPayment returns the payment analysis, the outpoints to spend, and the debt Houston
-// settles out of the change output of this transaction.
-func analyzeOnchainPayment(amount int64, realtime realtimeData, nextSize nextTransactionSize) (*operation.PaymentAnalysis, []string, int64, error) {
+// analyzeOnchainPayment includes expected debt in the spendable-capacity check,
+// not in the transaction fee used for signature verification.
+func analyzeOnchainPayment(amount int64, realtime realtimeData, nextSize nextTransactionSize) (*operation.PaymentAnalysis, []string, error) {
 	if realtime.FeeWindow == nil || realtime.ExchangeRateWindow == nil {
-		return nil, nil, 0, errors.New("Houston realtime data has no fee or exchange-rate window")
+		return nil, nil, errors.New("Houston realtime data has no fee or exchange-rate window")
 	}
 	if realtime.FeeWindow.FastConfTarget <= 0 {
-		return nil, nil, 0, errors.New("Houston realtime data has an invalid fast confirmation target")
+		return nil, nil, errors.New("Houston realtime data has an invalid fast confirmation target")
 	}
 	feeRate, found := realtime.FeeWindow.TargetedFees[strconv.FormatInt(realtime.FeeWindow.FastConfTarget, 10)]
 	if !found || feeRate <= 0 || math.IsNaN(feeRate) || math.IsInf(feeRate, 0) {
-		return nil, nil, 0, errors.New("Houston realtime data has no valid fast fee rate")
+		return nil, nil, errors.New("Houston realtime data has no valid fast fee rate")
 	}
 	expectedDebt := int64(0)
 	if nextSize.ExpectedDebtInSat != nil {
 		expectedDebt = *nextSize.ExpectedDebtInSat
 	}
 	if expectedDebt < 0 {
-		return nil, nil, 0, errors.New("Houston returned a negative expected debt")
+		return nil, nil, errors.New("Houston returned a negative expected debt")
 	}
 
 	progression := make([]operation.SizeForAmount, 0, len(nextSize.SizeProgression))
 	outpoints := make([]string, 0, len(nextSize.SizeProgression))
 	for index, item := range nextSize.SizeProgression {
 		if item.AmountInSatoshis < 0 || item.SizeInBytes <= 0 || item.Outpoint == "" {
-			return nil, nil, 0, fmt.Errorf("Houston returned an invalid size progression item %d", index)
+			return nil, nil, fmt.Errorf("Houston returned an invalid size progression item %d", index)
 		}
 		status, found := operation.MapUtxoStatus(item.Status)
 		if !found {
-			return nil, nil, 0, fmt.Errorf("Houston returned an unknown UTXO status %q", item.Status)
+			return nil, nil, fmt.Errorf("Houston returned an unknown UTXO status %q", item.Status)
 		}
 		progression = append(progression, operation.SizeForAmount{
 			AmountInSat: item.AmountInSatoshis,
@@ -1163,7 +1245,7 @@ func analyzeOnchainPayment(amount int64, realtime realtimeData, nextSize nextTra
 		outpoints = append(outpoints, item.Outpoint)
 	}
 	if len(progression) == 0 {
-		return nil, nil, 0, errors.New("wallet has no spendable UTXOs")
+		return nil, nil, errors.New("wallet has no spendable UTXOs")
 	}
 
 	analyzer := operation.NewPaymentAnalyzer(
@@ -1176,12 +1258,12 @@ func analyzeOnchainPayment(amount int64, realtime realtimeData, nextSize nextTra
 		FeeRateInSatsPerVByte: feeRate,
 	})
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("analyze on-chain payment: %w", err)
+		return nil, nil, fmt.Errorf("analyze on-chain payment: %w", err)
 	}
 	if analysis.Status != operation.AnalysisStatusOk {
-		return nil, nil, 0, fmt.Errorf("on-chain payment is %s", analysis.Status)
+		return nil, nil, fmt.Errorf("on-chain payment is %s", analysis.Status)
 	}
-	return analysis, outpoints, expectedDebt, nil
+	return analysis, outpoints, nil
 }
 
 func analyzeLightningPayment(
@@ -1286,6 +1368,10 @@ func musigPublicNonces(nonces *libwallet.MusigNonces) []string {
 	return values
 }
 
+// errTransactionVerification marks a libwallet Verify rejection. Verify runs before Sign, so
+// such a failure leaves the MuSig nonces unused.
+var errTransactionVerification = errors.New("verify partially signed transaction")
+
 func signPartiallySignedTransaction(
 	basePrivateKey *libwallet.HDPrivateKey,
 	muunPublicKey *libwallet.HDPublicKey,
@@ -1316,7 +1402,7 @@ func signPartiallySignedTransaction(
 		return nil, fmt.Errorf("build partially signed transaction: %w", err)
 	}
 	if err := transaction.Verify(expectations, basePrivateKey.PublicKey(), muunPublicKey); err != nil {
-		return nil, fmt.Errorf("verify partially signed transaction: %w", err)
+		return nil, fmt.Errorf("%w: %w", errTransactionVerification, err)
 	}
 	signed, err := transaction.Sign(basePrivateKey, muunPublicKey)
 	if err != nil {

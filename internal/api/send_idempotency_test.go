@@ -152,7 +152,7 @@ func TestSendUsesContractErrorCodesByFailurePhase(t *testing.T) {
 
 func TestOperationLookupReturnsNormalizedDetail(t *testing.T) {
 	t.Parallel()
-	want := wallet.OperationDetail{ID: 42, Status: "CONFIRMED", PaymentState: "paid", CreatedAt: "2026-09-28T00:00:00Z", AmountSatoshis: 1_000, FeeSatoshis: 10, Confirmations: 2}
+	want := wallet.OperationDetail{ID: 42, Direction: "OUTGOING", Status: "SWAP_PAYED", PaymentState: "paid", CreatedAt: "2026-09-28T00:00:00Z", AmountSatoshis: 1_000, FeeSatoshis: 10, PaymentHash: strings.Repeat("ab", 32)}
 	service := &fakeWallet{operationResult: want}
 	server := NewServer(service, "api-token")
 	request := httptest.NewRequest(http.MethodGet, "/operations/42", nil)
@@ -162,11 +162,15 @@ func TestOperationLookupReturnsNormalizedDetail(t *testing.T) {
 	if response.Code != http.StatusOK || service.operationID != 42 {
 		t.Fatalf("status=%d operationID=%d", response.Code, service.operationID)
 	}
+	body := response.Body.String()
 	var detail wallet.OperationDetail
 	if err := json.NewDecoder(response.Body).Decode(&detail); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(detail, want) {
 		t.Fatalf("detail = %#v, want %#v", detail, want)
+	}
+	if !strings.Contains(body, `"paymentHash":"`+want.PaymentHash+`"`) {
+		t.Fatalf("body = %s, want the paymentHash key", body)
 	}
 }

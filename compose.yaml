@@ -2,6 +2,9 @@ services:
   muun-wrapper:
     build:
       context: .
+      args:
+        # Set by make build and scripts/up.sh from scripts/apollo-image.sh.
+        APOLLO_IMAGE: ${APOLLO_IMAGE:-}
     env_file:
       - compose.secrets
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"

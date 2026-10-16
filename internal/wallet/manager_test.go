@@ -1015,3 +1015,113 @@ func TestOperationsSurfaceIncomingSwapPaymentHashAndPreimage(t *testing.T) {
 		t.Fatalf("operation = %#v", operations[0])
 	}
 }
+
+// TestOperationsSurfaceOutgoingSwapPaymentHash checks that an outgoing Lightning operation carries
+// the hash of the invoice it paid, so a caller can match it to the POST /send result. Onchain
+// operations carry none and the preimage stays incoming-only.
+func TestOperationsSurfaceOutgoingSwapPaymentHash(t *testing.T) {
+	t.Parallel()
+
+	muunKey := mustBaseKey(t, bytes.Repeat([]byte{15}, 32))
+	paymentHash := strings.Repeat("cd", 32)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/houston/sessions-v2/first":
+			w.Header().Set("Authorization", "Bearer session-token")
+			writeJSON(t, w, map[string]any{
+				"cosigningPublicKey":  map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+				"swapServerPublicKey": map[string]string{"key": muunKey.PublicKey().String(), "path": basePath},
+			})
+		case "/houston/user/external-addresses-record":
+			switch r.Method {
+			case http.MethodGet:
+				writeJSON(t, w, map[string]int{"maxUsedIndex": -1, "maxWatchingIndex": 100})
+			default:
+				writeJSON(t, w, map[string]int{"maxUsedIndex": 0, "maxWatchingIndex": 100})
+			}
+		case "/houston/operations":
+			writeJSON(t, w, []map[string]any{
+				{
+					"id":           float64(92),
+					"direction":    "OUTGOING",
+					"status":       "SWAP_PAYED",
+					"creationDate": "2026-09-28T00:00:00Z",
+					"swapUuid":     "outgoing-swap-uuid",
+					"amount":       map[string]any{"inSatoshis": 4_000},
+					"fee":          map[string]any{"inSatoshis": 12},
+					"swap": map[string]any{
+						"swapUuid":      "outgoing-swap-uuid",
+						"fundingOutput": map[string]any{"serverPaymentHashInHex": paymentHash},
+					},
+				},
+				{
+					"id":           float64(93),
+					"direction":    "OUTGOING",
+					"status":       "CONFIRMED",
+					"creationDate": "2026-09-28T00:00:00Z",
+					"amount":       map[string]any{"inSatoshis": 3_000},
+					"fee":          map[string]any{"inSatoshis": 5},
+					"transaction":  map[string]any{"hash": "outgoing-onchain-tx", "confirmations": 1},
+				},
+			})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, err := wallet.NewManager(wallet.Config{
+		DataDir:           t.TempDir(),
+		Passphrase:        "test passphrase",
+		HoustonURL:        server.URL + "/houston/",
+		PrimaryCurrency:   "USD",
+		ClientVersion:     1511,
+		ClientVersionName: "55.11",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	operations, err := manager.Operations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 2 {
+		t.Fatalf("operations = %d, want 2", len(operations))
+	}
+	if operations[0].PaymentHash != paymentHash || operations[0].Preimage != "" {
+		t.Fatalf("lightning operation = %#v", operations[0])
+	}
+	if operations[1].PaymentHash != "" || operations[1].Preimage != "" {
+		t.Fatalf("onchain operation = %#v", operations[1])
+	}
+
+	// GET /operations/{id} maps the same history entry, and the wire key is paymentHash.
+	for _, operation := range operations {
+		detail, err := manager.Operation(context.Background(), operation.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(detail, operation) {
+			t.Fatalf("detail = %#v, want %#v", detail, operation)
+		}
+	}
+	lightning, err := json.Marshal(operations[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(lightning), `"paymentHash":"`+paymentHash+`"`) {
+		t.Fatalf("lightning operation JSON = %s", lightning)
+	}
+	onchain, err := json.Marshal(operations[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(onchain), "paymentHash") {
+		t.Fatalf("onchain operation JSON = %s", onchain)
+	}
+}
