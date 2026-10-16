@@ -188,3 +188,11 @@ La especificación de la API REST, compatible con Swagger UI y otras herramienta
 [`docs/openapi.json`](docs/openapi.json). La referencia de comandos cliente está en
 [`docs/cli.md`](docs/cli.md). Para operar el stack local usá `./scripts/up.sh` y
 `./scripts/down.sh`.
+
+## Licencia
+
+El código de este wrapper se distribuye bajo la [licencia MIT](LICENSE).
+[Apollo y su core libwallet](https://github.com/muun/apollo), usados como dependencia,
+también se distribuyen bajo la [licencia MIT de Muun](https://github.com/muun/apollo/blob/e5f5e1bb54f611ef457c56207f2a34ac85b00827/LICENSE).
+Las dependencias conservan sus propias licencias y avisos de copyright; al redistribuirlas,
+conservá los avisos correspondientes.
